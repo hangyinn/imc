@@ -334,7 +334,8 @@ def test_segment_cli_options(monkeypatch):
     assert args.postprocessing_mode == "legacy"
     assert args.fill_gaps
     assert args.membrane_mode == "max"
-    assert args.whole_cell_threshold == 0.05
+    assert args.whole_cell_threshold is None
+    assert args.cell_expansion == 1.0
     assert args.min_cell_area == 15.0
     assert args.min_nucleus_area is None
     assert args.qc and not args.save_maps
@@ -365,6 +366,8 @@ def test_mesmer_sizes_given_in_um2():
     cell, nuc = mesmer_postprocess_kwargs(min_cell_area=0, min_nucleus_area=4)
     assert cell == dict()
     assert nuc == dict(small_objects_threshold=16, fill_holes_threshold=16)
+    cell, _ = mesmer_postprocess_kwargs(cell_expansion=1.0)
+    assert cell == dict(pixel_expansion=2)
 
 
 @pytest.fixture
@@ -447,8 +450,10 @@ def test_segment_roi_writes_outputs_to_folder(mesmer_calls, tmp_path):
         save_maps=True,
         output_dir=tmp_path / "new",
     )
-    assert mesmer_calls[0]["postprocess_kwargs_whole_cell"]["interior_threshold"] == 0.05
-    assert mesmer_calls[0]["postprocess_kwargs_whole_cell"]["small_objects_threshold"] == 60
+    kwargs = mesmer_calls[0]["postprocess_kwargs_whole_cell"]
+    assert "interior_threshold" not in kwargs
+    assert kwargs["pixel_expansion"] == 2
+    assert kwargs["small_objects_threshold"] == 60
     assert sorted(p.name for p in (tmp_path / "new").iterdir()) == [
         "x_full_cell_qc.csv",
         "x_full_mask.tiff",
@@ -512,3 +517,22 @@ def test_small_cells_removed_and_partial_nuclei_flagged():
     assert out[..., 0].max() == 3
     assert table["has_nucleus"].tolist() == [True, True, False]
     assert table["partial_nucleus"].tolist() == [False, True, False]
+
+
+def test_empty_cells_without_nucleus_are_removed():
+    cell = np.zeros(SHAPE, int)
+    nuc = np.zeros(SHAPE, int)
+    signal = np.zeros(SHAPE)
+    for i, x in enumerate([5, 17, 29, 41], 1):
+        cell[5:15, x : x + 10] = i
+        nuc[8:12, x + 3 : x + 7] = i
+    signal[5:15, 5:51] = 10
+    cell[25:35, 5:15] = 5  # no nucleus, with marker signal
+    signal[25:35, 5:15] = 10
+    cell[25:35, 30:40] = 6  # no nucleus, over an empty area
+    mask = np.stack([cell, nuc], -1)
+    out, table = qc_cell_and_nuclear_masks(mask, np.zeros(SHAPE), signal_image=signal)
+    check_pairing(out)
+    assert out[..., 0].max() == 5
+    assert out[30, 35, 0] == 0 and out[30, 10, 0] > 0
+    assert (~table["has_nucleus"]).sum() == 1

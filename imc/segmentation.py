@@ -81,6 +81,7 @@ def mesmer_postprocess_kwargs(
     whole_cell_threshold: float = None,
     min_cell_area: float = None,
     min_nucleus_area: float = None,
+    cell_expansion: float = None,
 ) -> tp.Tuple[tp.Dict[str, tp.Any], tp.Dict[str, tp.Any]]:
     """
     Mesmer post-processing settings for the whole-cell and nuclear compartments.
@@ -99,6 +100,9 @@ def mesmer_postprocess_kwargs(
         Smallest cell kept, in um2.
     min_nucleus_area: float
         Smallest nucleus kept, in um2.
+    cell_expansion: float
+        Distance in um by which cells are grown after segmentation (Mesmer's
+        ``pixel_expansion``), into pixels not taken by another cell.
 
     Returns
     -------
@@ -114,6 +118,8 @@ def mesmer_postprocess_kwargs(
     cell = size_kwargs(min_cell_area)
     if whole_cell_threshold is not None:
         cell["interior_threshold"] = whole_cell_threshold
+    if cell_expansion:
+        cell["pixel_expansion"] = max(1, int(round(cell_expansion / MESMER_MPP)))
     return cell, size_kwargs(min_nucleus_area)
 
 
@@ -1332,6 +1338,17 @@ def dna_image(roi: _roi.ROI) -> Array:
     return np.asarray(stack[nuclear_channels(labels)], dtype=float).mean(0)
 
 
+def marker_signal_image(roi: _roi.ROI) -> Array:
+    """Sum of the antibody channels of an ROI other than DNA, without normalization."""
+    stack, labels = roi.stack, roi.channel_labels
+    if roi.channel_exclude is not None:
+        keep = ~np.asarray(roi.channel_exclude, dtype=bool)
+        stack, labels = stack[keep], labels[keep]
+    # channels without an antibody are labeled by mass only, e.g. '80ArAr(ArAr80)'
+    sel = ~(nuclear_channels(labels) | labels.str.match(r"^\d").values)
+    return np.asarray(stack[sel], dtype=float).sum(0)
+
+
 def qc_cell_and_nuclear_masks(
     mask: Array,
     nuclear_image: Array,
@@ -1342,6 +1359,8 @@ def qc_cell_and_nuclear_masks(
     max_union_area: float = 1.5,
     min_solidity: float = 0.9,
     min_contact: int = 3,
+    signal_image: Array = None,
+    empty_quantile: float = 0.01,
     verbose: bool = False,
 ) -> tp.Tuple[Array, pd.DataFrame]:
     """
@@ -1356,7 +1375,10 @@ def qc_cell_and_nuclear_masks(
            a convex object (solidity of at least ``min_solidity``) no larger than
            ``max_union_area`` times the median nucleus.
         2. Cells smaller than ``min_cell_area`` pixels are removed.
-        3. Nuclei are kept whatever their size. Nuclei smaller than
+        3. If ``signal_image`` is given, cells without a nucleus whose mean marker signal
+           is below the ``empty_quantile`` of that of cells with a nucleus are removed
+           (objects drawn over empty or nearly empty areas).
+        4. Nuclei are kept whatever their size. Nuclei smaller than
            ``partial_nucleus_area`` pixels are flagged as partial, for example a nucleus
            cut near its top or bottom by the section.
 
@@ -1366,6 +1388,8 @@ def qc_cell_and_nuclear_masks(
         Array of shape (Y, X, 2) with the cell and nuclear masks.
     nuclear_image: Array
         DNA image of shape (Y, X), without clipping (e.g. ``dna_image``).
+    signal_image: Array
+        Marker signal of shape (Y, X), e.g. ``marker_signal_image``.
 
     Returns
     -------
@@ -1441,6 +1465,19 @@ def qc_cell_and_nuclear_masks(
     cell[small[cell]] = 0
     nuc[cell == 0] = 0
 
+    # 3. Cells without a nucleus over empty areas
+    n_empty = 0
+    if signal_image is not None and cell.max() > 0:
+        ids = np.unique(cell)
+        ids = ids[ids > 0]
+        signal = ndi.mean(np.asarray(signal_image, dtype=float), labels=cell, index=ids)
+        has_nucleus = np.isin(ids, np.unique(nuc[nuc > 0]))
+        if has_nucleus.any():
+            floor = np.quantile(signal[has_nucleus], empty_quantile)
+            empty = ids[(~has_nucleus) & (signal < floor)]
+            n_empty = len(empty)
+            cell[np.isin(cell, empty)] = 0
+
     # Labels made consecutive; nuclei take the label of their cell
     new = relabel_sequential(cell)[0]
     nuc = np.where(nuc > 0, new, 0)
@@ -1462,8 +1499,9 @@ def qc_cell_and_nuclear_masks(
     if verbose:
         print(
             f"Cell QC: {n_merged} nuclei split in two were merged, {int(small.sum())} cells "
-            f"under {min_cell_area:g} px removed; {int((~table['has_nucleus']).sum())} cells "
-            f"without nucleus, {int(table['partial_nucleus'].sum())} with a partial nucleus."
+            f"under {min_cell_area:g} px and {n_empty} empty cells without nucleus removed; "
+            f"{int((~table['has_nucleus']).sum())} cells without nucleus, "
+            f"{int(table['partial_nucleus'].sum())} with a partial nucleus."
         )
     return np.stack([new, nuc], axis=-1).astype(np.uint32), table
 
@@ -1484,7 +1522,8 @@ def segment_roi(
     fill_gaps: bool = False,
     output_mask_suffix: str = "",
     membrane_mode: str = "max",
-    whole_cell_threshold: float = 0.05,
+    whole_cell_threshold: float = None,
+    cell_expansion: float = 1.0,
     min_cell_area: float = 15.0,
     min_nucleus_area: float = None,
     qc: bool = True,
@@ -1531,9 +1570,12 @@ def segment_roi(
         How membrane channels are combined into the membrane image (``max`` or
         ``mean``), see ``prepare_stack``.
     whole_cell_threshold: float
-        Threshold on Mesmer's predicted cell interior probability. Lower values give
-        larger cells; Mesmer's default (0.2) draws outlines close to the nucleus on IMC
-        images. ``None`` keeps Mesmer's default.
+        Threshold on Mesmer's predicted cell interior probability; lower values give
+        larger cells. ``None`` keeps Mesmer's default (0.2).
+    cell_expansion: float
+        Distance in um by which Mesmer grows cells after segmentation. At Mesmer's
+        default threshold, outlines on IMC images lie close to the nucleus; 1 um brings
+        them to the membrane signal.
     min_cell_area: float
         Smallest cell kept, in um2, applied in Mesmer and after pairing. ``None`` or 0
         keeps Mesmer's default (15 pixels at 0.5 um/px, about 4 um2).
@@ -1541,8 +1583,8 @@ def segment_roi(
         Smallest nucleus kept by Mesmer, in um2. ``None`` keeps Mesmer's default.
     qc: bool
         Whether to apply ``qc_cell_and_nuclear_masks`` after pairing (``align`` mode):
-        nuclei split in two are merged, cells below ``min_cell_area`` are removed and a
-        per-cell QC table is made.
+        nuclei split in two are merged, cells below ``min_cell_area`` and cells without
+        a nucleus or marker signal are removed, and a per-cell QC table is made.
     partial_nucleus_area: float
         Nuclei smaller than this (um2) are flagged as partial in the QC table.
     save_maps: bool
@@ -1558,7 +1600,7 @@ def segment_roi(
     """
     assert postprocessing_mode in ["align", "legacy"]
     kw_cell, kw_nuc = mesmer_postprocess_kwargs(
-        whole_cell_threshold, min_cell_area, min_nucleus_area
+        whole_cell_threshold, min_cell_area, min_nucleus_area, cell_expansion
     )
     maps = None
     if from_probabilities:
@@ -1635,6 +1677,7 @@ def segment_roi(
                     dna_image(roi),
                     min_cell_area=(min_cell_area or 0) / px,
                     partial_nucleus_area=(partial_nucleus_area or 0) / px,
+                    signal_image=marker_signal_image(roi),
                     verbose=verbose,
                 )
                 cell_qc.insert(2, "area_um2", cell_qc["area"] * px)

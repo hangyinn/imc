@@ -648,11 +648,21 @@ cli_config = {
                 "kwargs": {
                     "dest": "whole_cell_threshold",
                     "type": float,
-                    "default": 0.05,
-                    "help": "Threshold on DeepCell's predicted cell interior probability, "
-                    "which sets how far cell outlines extend; lower values give larger cells. "
-                    "Default is 0.05 (DeepCell's own default, 0.2, draws outlines close to "
-                    "the nucleus on IMC images).",
+                    "default": None,
+                    "help": "Threshold on DeepCell's predicted cell interior probability; "
+                    "lower values give larger cells. Default is DeepCell's own (0.2).",
+                },
+            },
+            {
+                "args": ["--cell-expansion"],
+                "kwargs": {
+                    "dest": "cell_expansion",
+                    "type": float,
+                    "default": 1.0,
+                    "help": "Distance in micrometres by which cells are grown after "
+                    "segmentation, into pixels not taken by another cell. Default is 1 "
+                    "(at DeepCell's default threshold, outlines on IMC images lie close "
+                    "to the nucleus).",
                 },
             },
             {

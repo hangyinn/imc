@@ -76,6 +76,7 @@ def main(cli: tp.Sequence[str] = None) -> int:
                 output_mask_suffix=args.output_mask_suffix,
                 membrane_mode=args.membrane_mode,
                 whole_cell_threshold=args.whole_cell_threshold,
+                cell_expansion=args.cell_expansion,
                 min_cell_area=args.min_cell_area,
                 min_nucleus_area=args.min_nucleus_area,
                 qc=args.qc,
