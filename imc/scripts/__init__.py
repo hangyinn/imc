@@ -633,6 +633,90 @@ cli_config = {
                 },
             },
             {
+                "args": ["--membrane-mode"],
+                "kwargs": {
+                    "dest": "membrane_mode",
+                    "choices": ["mean", "max"],
+                    "default": "max",
+                    "help": "How membrane channels are combined into the membrane image: "
+                    "'max' takes the brightest marker in each pixel, 'mean' averages them. "
+                    "Default is 'max'.",
+                },
+            },
+            {
+                "args": ["--whole-cell-threshold"],
+                "kwargs": {
+                    "dest": "whole_cell_threshold",
+                    "type": float,
+                    "default": 0.05,
+                    "help": "Threshold on DeepCell's predicted cell interior probability, "
+                    "which sets how far cell outlines extend; lower values give larger cells. "
+                    "Default is 0.05 (DeepCell's own default, 0.2, draws outlines close to "
+                    "the nucleus on IMC images).",
+                },
+            },
+            {
+                "args": ["--min-cell-area"],
+                "kwargs": {
+                    "dest": "min_cell_area",
+                    "type": float,
+                    "default": 15.0,
+                    "help": "Smallest cell kept, in square micrometres. Default is 15. "
+                    "0 keeps DeepCell's own limit (15 pixels at 0.5 um/px, about 4 um2).",
+                },
+            },
+            {
+                "args": ["--min-nucleus-area"],
+                "kwargs": {
+                    "dest": "min_nucleus_area",
+                    "type": float,
+                    "default": None,
+                    "help": "Smallest nucleus kept, in square micrometres. "
+                    "Default keeps DeepCell's own limit (about 4 um2).",
+                },
+            },
+            {
+                "args": ["--partial-nucleus-area"],
+                "kwargs": {
+                    "dest": "partial_nucleus_area",
+                    "type": float,
+                    "default": 15.0,
+                    "help": "Nuclei smaller than this, in square micrometres, are flagged "
+                    "as partial in the cell QC table. Default is 15.",
+                },
+            },
+            {
+                "args": ["--no-qc"],
+                "kwargs": {
+                    "dest": "qc",
+                    "action": "store_false",
+                    "help": "Whether to skip the quality control of paired cell and nuclear "
+                    "masks (merging nuclei split in two, removing cells below "
+                    "'--min-cell-area' and writing a per-cell QC table). "
+                    "Only used with '--post-processing align'.",
+                },
+            },
+            {
+                "args": ["--save-maps"],
+                "kwargs": {
+                    "dest": "save_maps",
+                    "action": "store_true",
+                    "help": "Whether to save DeepCell's per-pixel outputs (cell and nucleus "
+                    "interior probability and inner distance) and its input images. "
+                    "Only used with '--model deepcell --compartment both' from the stack.",
+                },
+            },
+            {
+                "args": ["--output-dir"],
+                "kwargs": {
+                    "dest": "output_dir",
+                    "type": Path,
+                    "default": None,
+                    "help": "Directory to write the masks and other outputs to. "
+                    "Default is next to each input TIFF.",
+                },
+            },
+            {
                 "args": ["--verbose"],
                 "kwargs": {
                     "dest": "quiet",

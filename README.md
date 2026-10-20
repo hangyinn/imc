@@ -20,21 +20,25 @@ Development is still underway, so use at your own risk.
 `imc segment` in this fork differs from [ElementoLab/imc](https://github.com/ElementoLab/imc) as follows:
 
 - **Pixel size.** Images are passed to DeepCell (Mesmer) at full resolution together with their pixel size (`--image-mpp`, default 1.0 µm). Mesmer was trained at 0.5 µm per pixel and rescales its input accordingly.
-- **Membrane image.** When segmenting from the stack, the membrane image is the mean of the antibody channels except Ki67 and SMA, or of the markers given with `--membrane-channels`.
+- **Membrane image.** When segmenting from the stack, the membrane image combines the antibody channels except Ki67 and SMA, or the markers given with `--membrane-channels`. Each marker is scaled between its 1st and 99.8th percentiles, and each pixel takes the brightest marker (`--membrane-mode max`, default) or the mean of the markers (`--membrane-mode mean`).
+- **Cell outlines.** `--whole-cell-threshold` (default 0.05) sets how far cell outlines extend from Mesmer's predicted cell interior. Mesmer's own default (0.2) draws outlines close to the nucleus on IMC images.
+- **Object sizes in µm².** `--min-cell-area` (default 15 µm²) and `--min-nucleus-area` (default: Mesmer's own limit, about 4 µm²) are converted to Mesmer's working scale (0.5 µm per pixel).
 - **Pairing of cells and nuclei** (`--post-processing align`, default). No object is removed: a cell holding several nuclei is divided between them, a nucleus spanning several cells is given to the cell holding most of it (more than 80%) or divided along the cell border, a nucleus outside all cells becomes a cell, and a cell without a nucleus has no nucleus in the nuclear mask. `--post-processing legacy` applies the original rules.
+- **Quality control after pairing** (default; `--no-qc` to skip). Two touching nuclei with no dip in DNA signal between them, which together form one convex nucleus of normal size, are merged with their cells. Cells smaller than `--min-cell-area` are removed. Nuclei are kept whatever their size, and a table `<roi>_full_cell_qc.csv` gives the area of each cell and its nucleus, and flags cells without a nucleus or with a nucleus smaller than `--partial-nucleus-area` (default 15 µm²).
 - **Gap filling** (`--fill-gaps`, optional). Nuclei visible in the DNA channels but not covered by any cell are added as cells.
+- **Outputs.** `--output-dir` writes the outputs to a separate folder. `--save-maps` also saves Mesmer's per-pixel outputs (cell and nucleus interior probability and inner distance, `<roi>_full_mesmer_maps.tiff`) and its two input images (`<roi>_full_mesmer_input.tiff`).
 - Label masks are resized with nearest-neighbour interpolation, and `--output-mask-suffix` is applied to the mask file names.
 
 Example:
 ```bash
 imc segment \
   --model deepcell --compartment both \
-  --membrane-channels CD20,HLADR,CD3,CD4,CD8a,CD45RO,CD38,CD68,CD14,CD11b,CD11c,CD16,CD31,CD56,CD27,CD123 \
-  --output-mask-suffix _v2 \
+  --membrane-channels CD20,HLADR,CD38,CD3,CD4,CD8a,CD56,CD16,CD68,CD14,CD11b,CD11c,CD31 \
+  --save-maps --output-dir segmentation \
   processed/*/tiffs/*_full.tiff
 ```
 
-Masks of the original package are reproduced with `imc segment --from-probabilities --model deepcell --compartment both --image-mpp 0.5 --post-processing legacy`.
+Masks of the original package are reproduced with `imc segment --from-probabilities --model deepcell --compartment both --image-mpp 0.5 --whole-cell-threshold 0.2 --min-cell-area 0 --post-processing legacy`.
 
 
 ## Requirements and installation

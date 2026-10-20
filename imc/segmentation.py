@@ -5,7 +5,7 @@ such as Stardist and DeepCell.
 
 
 import typing as tp
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 import pandas as pd
@@ -51,6 +51,72 @@ def marker_names(channel_labels: Series) -> Series:
     return channel_labels.str.replace(r"\(.*$", "", regex=True).str.strip()
 
 
+# Resolution (um/px) at which DeepCell's Mesmer model works; images are rescaled to it
+# and Mesmer counts object sizes in pixels at this scale.
+MESMER_MPP = 0.5
+# Per-pixel outputs of Mesmer used by its watershed, as returned by ``deepcell_segment``.
+MESMER_MAPS = [
+    "cell_interior",
+    "cell_inner_distance",
+    "nucleus_interior",
+    "nucleus_inner_distance",
+]
+
+
+def nuclear_channels(channel_labels: Series) -> Array:
+    """Boolean array marking the DNA (iridium) channels."""
+    nuclear_chs = (
+        channel_labels.str.contains(r"DNA|Iridium", regex=True)
+        | channel_labels.str.contains("191Ir(Ir191)", regex=False)
+        | channel_labels.str.contains("193Ir(Ir193)", regex=False)
+    ).values
+    if nuclear_chs.sum() == 0:
+        raise ValueError(
+            "Could not determine nuclear channels using 'DNA', 'Iridium', or Ir91/Ir193."
+        )
+    return nuclear_chs
+
+
+def mesmer_postprocess_kwargs(
+    whole_cell_threshold: float = None,
+    min_cell_area: float = None,
+    min_nucleus_area: float = None,
+) -> tp.Tuple[tp.Dict[str, tp.Any], tp.Dict[str, tp.Any]]:
+    """
+    Mesmer post-processing settings for the whole-cell and nuclear compartments.
+
+    Mesmer rescales images to ``MESMER_MPP`` before segmentation and removes objects,
+    and fills holes, smaller than a number of pixels counted at that scale. Sizes are
+    given here in square micrometres and converted to that scale. ``None`` or 0 keeps
+    Mesmer's default of 15 pixels (about 4 um2).
+
+    Parameters
+    ----------
+    whole_cell_threshold: float
+        Threshold on the predicted cell interior probability, which sets how far cell
+        outlines extend (Mesmer's ``interior_threshold``, by default 0.2).
+    min_cell_area: float
+        Smallest cell kept, in um2.
+    min_nucleus_area: float
+        Smallest nucleus kept, in um2.
+
+    Returns
+    -------
+    Settings for ``postprocess_kwargs_whole_cell`` and ``postprocess_kwargs_nuclear``.
+    """
+
+    def size_kwargs(area: tp.Optional[float]) -> tp.Dict[str, tp.Any]:
+        if not area:
+            return dict()
+        n = max(1, int(round(area / MESMER_MPP**2)))
+        return dict(small_objects_threshold=n, fill_holes_threshold=n)
+
+    cell = size_kwargs(min_cell_area)
+    if whole_cell_threshold is not None:
+        cell["interior_threshold"] = whole_cell_threshold
+    return cell, size_kwargs(min_nucleus_area)
+
+
 def prepare_stack(
     stack: Array,
     channel_labels: Series,
@@ -58,6 +124,7 @@ def prepare_stack(
     channel_exclude: Series = None,
     membrane_channels: tp.Sequence[str] = None,
     normalization: str = "equalize",
+    membrane_mode: str = "mean",
 ) -> Array:
     """
     Make the nuclear and/or membrane image used as segmentation input.
@@ -79,9 +146,14 @@ def prepare_stack(
     normalization: str
         ``equalize`` (histogram equalization, the input of the ilastik model) or
         ``percentile`` (scaling between the 1st and 99.8th percentiles).
+    membrane_mode: str
+        How the normalized membrane channels are combined: ``mean``, or ``max`` (the
+        brightest marker in each pixel, so that a cell expressing only one of the
+        markers is outlined as clearly as one expressing several).
     """
     assert compartment in ["nuclear", "cytoplasm", "both"]
     assert normalization in ["equalize", "percentile"]
+    assert membrane_mode in ["mean", "max"]
     norm = normalize if normalization == "equalize" else percentile_normalize
 
     if channel_exclude is not None:
@@ -90,16 +162,7 @@ def prepare_stack(
         channel_labels = channel_labels[keep]
 
     # Get nuclear channels
-    nuclear_chs = (
-        channel_labels.str.contains(r"DNA|Iridium", regex=True)
-        | channel_labels.str.contains("191Ir(Ir191)", regex=False)
-        | channel_labels.str.contains("193Ir(Ir193)", regex=False)
-    ).values
-    if nuclear_chs.sum() == 0:
-        raise ValueError(
-            "Could not determine nuclear channels using 'DNA', 'Iridium', or Ir91/Ir193."
-        )
-
+    nuclear_chs = nuclear_channels(channel_labels)
     nucl = norm(stack[nuclear_chs]).mean(0)
     if compartment == "nuclear":
         return nucl
@@ -118,7 +181,8 @@ def prepare_stack(
         no_antibody = channel_labels.str.match(r"^\d").values
         other = channel_labels.str.contains(r"Ki67|SMA", regex=True).values
         cyto_chs = ~(nuclear_chs | no_antibody | other)
-    cyto = norm(stack[cyto_chs]).mean(0)
+    cyto = norm(stack[cyto_chs])
+    cyto = cyto.max(0) if membrane_mode == "max" else cyto.mean(0)
     if compartment == "cytoplasm":
         return cyto
 
@@ -396,12 +460,76 @@ def join_tiles_to_image(
     return rec
 
 
+@lru_cache(maxsize=None)
+def _deepcell_application(app_class: tp.Any) -> tp.Any:
+    """One instance per DeepCell application, so that its model is loaded only once."""
+    return app_class()
+
+
+def _predict_with_maps(
+    app: tp.Any, image: Array, image_mpp: float, kwargs: tp.Dict[str, tp.Any]
+) -> tp.Tuple[Array, Array]:
+    """Run Mesmer and also return the per-pixel outputs its watershed starts from."""
+    from skimage.transform import resize as resize_image
+
+    captured = dict()
+    postprocess = app._postprocess
+
+    def keep_output(output, **postprocess_kwargs):
+        captured["output"] = output
+        return postprocess(output, **postprocess_kwargs)
+
+    app._postprocess = keep_output
+    try:
+        pred = app.predict(image, image_mpp=image_mpp, **kwargs).squeeze()
+    finally:
+        app._postprocess = postprocess
+    out = captured["output"]
+    # Mesmer gives [inner distance, interior probability] for each compartment
+    layers = [out["whole-cell"][1], out["whole-cell"][0], out["nuclear"][1], out["nuclear"][0]]
+    shape = image.shape[1:3]
+    maps = np.stack(
+        [
+            resize_image(
+                np.squeeze(np.asarray(x)).astype(np.float32),
+                shape,
+                order=1,
+                anti_aliasing=True,
+                preserve_range=True,
+            )
+            for x in layers
+        ]
+    )
+    return pred, maps.astype(np.float32)
+
+
 def deepcell_segment(
     image: Array,
     compartment: str = None,
     image_mpp: float = None,
     use_tilling: bool = False,
-) -> Array:
+    postprocess_kwargs_whole_cell: tp.Dict[str, tp.Any] = None,
+    postprocess_kwargs_nuclear: tp.Dict[str, tp.Any] = None,
+    return_maps: bool = False,
+) -> tp.Union[Array, tp.Tuple[Array, Array]]:
+    """
+    Segment an image with a DeepCell model.
+
+    Parameters
+    ----------
+    image: Array
+        Image of shape (1, Y, X, C), see ``to_deepcell_input``.
+    compartment: str
+        One of ``nuclear``, ``cytoplasm`` or ``both`` (Mesmer).
+    image_mpp: float
+        Pixel size of ``image`` in micrometres.
+    postprocess_kwargs_whole_cell, postprocess_kwargs_nuclear: dict
+        Post-processing settings passed to Mesmer (compartment ``both``), for example
+        from ``mesmer_postprocess_kwargs``.
+    return_maps: bool
+        Whether to also return Mesmer's per-pixel outputs (compartment ``both``, without
+        tiling), an array of shape (4, Y, X) with the layers in ``MESMER_MAPS``.
+    """
     from deepcell.applications import (
         MultiplexSegmentation,
         NuclearSegmentation,
@@ -415,14 +543,23 @@ def deepcell_segment(
 
     kwargs = dict()
     if compartment == "nuclear":
-        app = NuclearSegmentation()
+        app = _deepcell_application(NuclearSegmentation)
     if compartment == "cytoplasm":
-        app = CytoplasmSegmentation()
+        app = _deepcell_application(CytoplasmSegmentation)
     if compartment == "both":
-        app = MultiplexSegmentation()
+        app = _deepcell_application(MultiplexSegmentation)
         kwargs = dict(compartment=compartment)
+        if postprocess_kwargs_whole_cell:
+            kwargs["postprocess_kwargs_whole_cell"] = dict(postprocess_kwargs_whole_cell)
+        if postprocess_kwargs_nuclear:
+            kwargs["postprocess_kwargs_nuclear"] = dict(postprocess_kwargs_nuclear)
 
-    if not use_tilling:
+    maps = None
+    if return_maps:
+        if compartment != "both" or use_tilling:
+            raise ValueError("Maps are only returned for compartment 'both' without tiling.")
+        pred, maps = _predict_with_maps(app, image, image_mpp, kwargs)
+    elif not use_tilling:
         pred = app.predict(image, image_mpp=image_mpp, **kwargs).squeeze()
     else:
         tiles = split_image_into_tiles(image.squeeze())
@@ -446,6 +583,8 @@ def deepcell_segment(
 
     if pred.shape[:2] != image.shape[1:3]:
         pred = resize_labels(pred, image.shape[1:3] + pred.shape[2:])
+    if return_maps:
+        return pred, maps
     return pred
 
 
@@ -657,7 +796,11 @@ def plot_image_and_mask(image: Array, mask_dict: tp.Dict[str, Array]) -> Figure:
 
 
 def deepcell_segment_probabilities(
-    probabilities: Array, compartment: str, image_mpp: float = 1.0
+    probabilities: Array,
+    compartment: str,
+    image_mpp: float = 1.0,
+    postprocess_kwargs_whole_cell: tp.Dict[str, tp.Any] = None,
+    postprocess_kwargs_nuclear: tp.Dict[str, tp.Any] = None,
 ) -> Array:
     """
     Segment ilastik probabilities (YXC: nuclear, cytoplasm, background) with the
@@ -672,6 +815,9 @@ def deepcell_segment_probabilities(
     image_mpp: float
         Pixel size of ``probabilities`` in micrometres. Mesmer was trained at
         0.5 um/px and rescales the input by ``image_mpp / 0.5``.
+    postprocess_kwargs_whole_cell, postprocess_kwargs_nuclear: dict
+        Post-processing settings passed to Mesmer, for example from
+        ``mesmer_postprocess_kwargs``.
     """
     from deepcell.applications import MultiplexSegmentation
 
@@ -683,11 +829,17 @@ def deepcell_segment_probabilities(
         "both": "both",
     }
 
-    app = MultiplexSegmentation()
+    kwargs = dict()
+    if postprocess_kwargs_whole_cell:
+        kwargs["postprocess_kwargs_whole_cell"] = dict(postprocess_kwargs_whole_cell)
+    if postprocess_kwargs_nuclear:
+        kwargs["postprocess_kwargs_nuclear"] = dict(postprocess_kwargs_nuclear)
+    app = _deepcell_application(MultiplexSegmentation)
     pred: Array = app.predict(
         probabilities[np.newaxis, ..., :-1],
         image_mpp=image_mpp,
         compartment=imc2dc[compartment],
+        **kwargs,
     )
     return pred.squeeze()
 
@@ -1171,6 +1323,151 @@ def _detect_nuclei_in_gaps(
     return relabel_sequential(nuclei)[0]
 
 
+def dna_image(roi: _roi.ROI) -> Array:
+    """Mean of the DNA channels of an ROI, without normalization or clipping."""
+    stack, labels = roi.stack, roi.channel_labels
+    if roi.channel_exclude is not None:
+        keep = ~np.asarray(roi.channel_exclude, dtype=bool)
+        stack, labels = stack[keep], labels[keep]
+    return np.asarray(stack[nuclear_channels(labels)], dtype=float).mean(0)
+
+
+def qc_cell_and_nuclear_masks(
+    mask: Array,
+    nuclear_image: Array,
+    min_cell_area: float = 15,
+    partial_nucleus_area: float = 15,
+    merge_split_nuclei: bool = True,
+    border_ratio: float = 0.9,
+    max_union_area: float = 1.5,
+    min_solidity: float = 0.9,
+    min_contact: int = 3,
+    verbose: bool = False,
+) -> tp.Tuple[Array, pd.DataFrame]:
+    """
+    Quality control of paired cell and nuclear masks, as returned by
+    ``align_cell_and_nuclear_masks`` (each nucleus carries the label of its cell).
+
+    Rules, in order:
+        1. A nucleus split in two is made whole again: two touching nuclei, with their
+           cells, are merged when the DNA signal along their shared border (at least
+           ``min_contact`` pixels) is at least ``border_ratio`` times the mean DNA
+           signal of the brighter nucleus (no dip between them), and together they form
+           a convex object (solidity of at least ``min_solidity``) no larger than
+           ``max_union_area`` times the median nucleus.
+        2. Cells smaller than ``min_cell_area`` pixels are removed.
+        3. Nuclei are kept whatever their size. Nuclei smaller than
+           ``partial_nucleus_area`` pixels are flagged as partial, for example a nucleus
+           cut near its top or bottom by the section.
+
+    Parameters
+    ----------
+    mask: Array
+        Array of shape (Y, X, 2) with the cell and nuclear masks.
+    nuclear_image: Array
+        DNA image of shape (Y, X), without clipping (e.g. ``dna_image``).
+
+    Returns
+    -------
+    The masks, shape (Y, X, 2), and a table with one row per cell: ``cell`` (label),
+    ``area`` and ``nucleus_area`` (pixels), ``has_nucleus``, ``partial_nucleus`` and
+    ``merged_pieces`` (number of segmented cells merged into this one).
+    """
+    from skimage.morphology import convex_hull_image
+    from skimage.segmentation import relabel_sequential
+
+    if (mask.ndim != 3) or (mask.shape[-1] != 2):
+        raise ValueError("Mask must have shape (Y, X, 2) with cell and nuclear masks.")
+    cell = mask[..., 0].astype(np.int64)
+    nuc = np.where(mask[..., 1] > 0, cell, 0)
+    target = np.arange(cell.max() + 1)
+    n_merged = 0
+
+    # 1. Nuclei split in two
+    if merge_split_nuclei and nuc.max() > 0:
+        dna = ndi.gaussian_filter(np.asarray(nuclear_image, dtype=float), 1.0)
+        ids = np.unique(nuc)
+        ids = ids[ids > 0]
+        mean_dna = np.zeros(nuc.max() + 1)
+        mean_dna[ids] = ndi.mean(dna, labels=nuc, index=ids)
+        area = np.bincount(nuc.ravel(), minlength=nuc.max() + 1)
+        median_area = np.median(area[ids])
+        border = list()
+        for a, b, dy, dx in [(nuc[:, :-1], nuc[:, 1:], 0, 1), (nuc[:-1, :], nuc[1:, :], 1, 0)]:
+            sel = (a > 0) & (b > 0) & (a != b)
+            y, x = np.nonzero(sel)
+            border.append(
+                pd.DataFrame(
+                    {
+                        "a": np.minimum(a[sel], b[sel]),
+                        "b": np.maximum(a[sel], b[sel]),
+                        "dna": (dna[y, x] + dna[y + dy, x + dx]) / 2,
+                    }
+                )
+            )
+        pairs = pd.concat(border).groupby(["a", "b"])["dna"].agg(["mean", "size"])
+        pairs = pairs.reset_index()
+        a, b = pairs["a"].values, pairs["b"].values
+        pairs["ratio"] = pairs["mean"].values / np.maximum(mean_dna[a], mean_dna[b])
+        pairs = pairs[
+            (pairs["size"] >= min_contact)
+            & (pairs["ratio"] >= border_ratio)
+            & (area[a] + area[b] <= max_union_area * median_area)
+        ].sort_values("ratio", ascending=False)
+        objs = ndi.find_objects(nuc)
+        used = set()
+        for a, b in zip(pairs["a"].values, pairs["b"].values):
+            if (a in used) or (b in used):
+                continue
+            sl = tuple(
+                slice(min(p.start, q.start), max(p.stop, q.stop))
+                for p, q in zip(objs[a - 1], objs[b - 1])
+            )
+            union = np.isin(nuc[sl], [a, b])
+            if union.sum() / convex_hull_image(union).sum() < min_solidity:
+                continue
+            keep, drop = (a, b) if area[a] >= area[b] else (b, a)
+            target[drop] = keep
+            used.update([a, b])
+            n_merged += 1
+        cell = target[cell]
+        nuc = target[nuc]
+    pieces = np.bincount(target, minlength=len(target))
+
+    # 2. Small cells
+    cell_area = np.bincount(cell.ravel(), minlength=cell.max() + 1)
+    small = (cell_area > 0) & (cell_area < min_cell_area)
+    small[0] = False
+    cell[small[cell]] = 0
+    nuc[cell == 0] = 0
+
+    # Labels made consecutive; nuclei take the label of their cell
+    new = relabel_sequential(cell)[0]
+    nuc = np.where(nuc > 0, new, 0)
+    old_of_new = np.zeros(new.max() + 1, dtype=np.int64)
+    old_of_new[new[new > 0]] = cell[new > 0]
+    ids = np.arange(1, new.max() + 1)
+    area = np.bincount(new.ravel(), minlength=new.max() + 1)[ids]
+    nuc_area = np.bincount(nuc.ravel(), minlength=new.max() + 1)[ids]
+    table = pd.DataFrame(
+        {
+            "cell": ids,
+            "area": area,
+            "nucleus_area": nuc_area,
+            "has_nucleus": nuc_area > 0,
+            "partial_nucleus": (nuc_area > 0) & (nuc_area < partial_nucleus_area),
+            "merged_pieces": pieces[old_of_new[ids]],
+        }
+    )
+    if verbose:
+        print(
+            f"Cell QC: {n_merged} nuclei split in two were merged, {int(small.sum())} cells "
+            f"under {min_cell_area:g} px removed; {int((~table['has_nucleus']).sum())} cells "
+            f"without nucleus, {int(table['partial_nucleus'].sum())} with a partial nucleus."
+        )
+    return np.stack([new, nuc], axis=-1).astype(np.uint32), table
+
+
 def segment_roi(
     roi: _roi.ROI,
     from_probabilities: bool = False,
@@ -1186,7 +1483,15 @@ def segment_roi(
     postprocessing_mode: str = "align",
     fill_gaps: bool = False,
     output_mask_suffix: str = "",
-) -> tp.Dict[str, Array]:
+    membrane_mode: str = "max",
+    whole_cell_threshold: float = 0.05,
+    min_cell_area: float = 15.0,
+    min_nucleus_area: float = None,
+    qc: bool = True,
+    partial_nucleus_area: float = 15.0,
+    save_maps: bool = False,
+    output_dir: Path = None,
+) -> tp.Dict[str, tp.Any]:
     """
     Segment the area of an ROI.
 
@@ -1222,8 +1527,40 @@ def segment_roi(
         Only used with ``postprocessing_mode`` ``align``.
     output_mask_suffix: str
         Suffix added to the mask file names, e.g. '_v2' writes '<roi>_full_mask_v2.tiff'.
+    membrane_mode: str
+        How membrane channels are combined into the membrane image (``max`` or
+        ``mean``), see ``prepare_stack``.
+    whole_cell_threshold: float
+        Threshold on Mesmer's predicted cell interior probability. Lower values give
+        larger cells; Mesmer's default (0.2) draws outlines close to the nucleus on IMC
+        images. ``None`` keeps Mesmer's default.
+    min_cell_area: float
+        Smallest cell kept, in um2, applied in Mesmer and after pairing. ``None`` or 0
+        keeps Mesmer's default (15 pixels at 0.5 um/px, about 4 um2).
+    min_nucleus_area: float
+        Smallest nucleus kept by Mesmer, in um2. ``None`` keeps Mesmer's default.
+    qc: bool
+        Whether to apply ``qc_cell_and_nuclear_masks`` after pairing (``align`` mode):
+        nuclei split in two are merged, cells below ``min_cell_area`` are removed and a
+        per-cell QC table is made.
+    partial_nucleus_area: float
+        Nuclei smaller than this (um2) are flagged as partial in the QC table.
+    save_maps: bool
+        Whether to save Mesmer's per-pixel outputs (``MESMER_MAPS``) and its input
+        images (``model`` deepcell, ``compartment`` both, from the stack).
+    output_dir: Path
+        Directory for the outputs. By default they are written next to the stack.
+
+    Returns
+    -------
+    Dictionary with the masks (``cell`` and/or ``nuclei``) and, when made, the QC table
+    (``cell_qc``) and Mesmer's per-pixel outputs (``mesmer_maps``).
     """
     assert postprocessing_mode in ["align", "legacy"]
+    kw_cell, kw_nuc = mesmer_postprocess_kwargs(
+        whole_cell_threshold, min_cell_area, min_nucleus_area
+    )
+    maps = None
     if from_probabilities:
         assert model in ["deepcell"]
         image = roi.probabilities
@@ -1231,7 +1568,11 @@ def segment_roi(
         shape = tuple([int(x / 2) for x in image.shape[1:]])
         image = resize(image / image.max(), (3,) + shape)
         mask = deepcell_segment_probabilities(
-            np.moveaxis(image, 0, -1), compartment, image_mpp=image_mpp
+            np.moveaxis(image, 0, -1),
+            compartment,
+            image_mpp=image_mpp,
+            postprocess_kwargs_whole_cell=kw_cell,
+            postprocess_kwargs_nuclear=kw_nuc,
         )
     else:
         assert model in ["deepcell", "stardist", "cellpose"]
@@ -1242,6 +1583,7 @@ def segment_roi(
             roi.channel_exclude,
             membrane_channels=membrane_channels,
             normalization="percentile" if model == "deepcell" else "equalize",
+            membrane_mode=membrane_mode,
         )
         if model == "stardist":
             assert compartment == "nuclear"
@@ -1249,11 +1591,19 @@ def segment_roi(
 
         elif model == "deepcell":
             mask = deepcell_segment(
-                to_deepcell_input(image), compartment=compartment, image_mpp=image_mpp
+                to_deepcell_input(image),
+                compartment=compartment,
+                image_mpp=image_mpp,
+                postprocess_kwargs_whole_cell=kw_cell,
+                postprocess_kwargs_nuclear=kw_nuc,
+                return_maps=save_maps and compartment == "both",
             )
+            if isinstance(mask, tuple):
+                mask, maps = mask
         elif model == "cellpose":
             mask = cellpose_segment(image, compartment)
 
+    cell_qc = None
     if postprocessing and compartment in ["both"]:
         if postprocessing_mode == "legacy":
             mask = deepcell_postprocess_both_compartments(
@@ -1278,6 +1628,17 @@ def segment_roi(
             mask = align_cell_and_nuclear_masks(
                 mask, nuclear_image=dna, fill_gaps=fill_gaps, verbose=verbose
             )
+            if qc:
+                px = image_mpp**2
+                mask, cell_qc = qc_cell_and_nuclear_masks(
+                    mask,
+                    dna_image(roi),
+                    min_cell_area=(min_cell_area or 0) / px,
+                    partial_nucleus_area=(partial_nucleus_area or 0) / px,
+                    verbose=verbose,
+                )
+                cell_qc.insert(2, "area_um2", cell_qc["area"] * px)
+                cell_qc.insert(4, "nucleus_area_um2", cell_qc["nucleus_area"] * px)
 
     mask_dict = dict()
     if compartment == "both":
@@ -1288,25 +1649,53 @@ def segment_roi(
     elif compartment == "cytoplasm":
         mask_dict["cell"] = mask
 
+    def output_file(file: Path, tag: str = "", ext: str = ".tiff") -> Path:
+        file = file.replace_(".tiff", tag + output_mask_suffix + ext)
+        return Path(output_dir) / file.name if output_dir is not None else file
+
     if save:
+        if output_dir is not None:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
         for comp, mask in mask_dict.items():
-            mask_file = roi.get_input_filename(comp + "_mask")
-            if output_mask_suffix:
-                mask_file = mask_file.replace_(".tiff", output_mask_suffix + ".tiff")
+            mask_file = output_file(roi.get_input_filename(comp + "_mask"))
             if overwrite or (not overwrite and not mask_file.exists()):
                 tifffile.imwrite(mask_file, mask)
+        stack_file = roi.get_input_filename("stack")
+        if cell_qc is not None:
+            cell_qc.to_csv(output_file(stack_file, "_cell_qc", ".csv"), index=False)
+        if maps is not None:
+            tifffile.imwrite(
+                output_file(stack_file, "_mesmer_maps"),
+                maps,
+                photometric="minisblack",
+                compression="zlib",
+                metadata={"axes": "CYX", "Channel": MESMER_MAPS},
+            )
+            tifffile.imwrite(
+                output_file(stack_file, "_mesmer_input"),
+                np.asarray(image, dtype=np.float32),
+                photometric="minisblack",
+                compression="zlib",
+                metadata={"axes": "CYX", "Channel": ["nuclear", "membrane"]},
+            )
 
     if plot_segmentation:
         fig = plot_image_and_mask(image, mask_dict)
         if save:
-            fig_file = roi.get_input_filename("stack").replace_(
-                ".tiff",
-                f"_segmentation_{model}_{compartment}{output_mask_suffix}.svg",
+            fig_file = output_file(
+                roi.get_input_filename("stack"),
+                f"_segmentation_{model}_{compartment}",
+                ".svg",
             )
             if overwrite or (not overwrite and not fig_file.exists()):
                 fig.savefig(fig_file, dpi=300, bbox_inches="tight")
 
-    return mask_dict
+    out = dict(mask_dict)
+    if cell_qc is not None:
+        out["cell_qc"] = cell_qc
+    if maps is not None:
+        out["mesmer_maps"] = maps
+    return out
 
 
 # def segment_decomposition():

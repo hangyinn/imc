@@ -6,12 +6,15 @@ import pandas as pd
 import pytest
 
 from imc.segmentation import (
+    MESMER_MAPS,
     align_cell_and_nuclear_masks,
     deepcell_postprocess_both_compartments,
     deepcell_segment,
     deepcell_segment_probabilities,
+    mesmer_postprocess_kwargs,
     percentile_normalize,
     prepare_stack,
+    qc_cell_and_nuclear_masks,
     resize_labels,
     segment_roi,
     to_deepcell_input,
@@ -330,3 +333,182 @@ def test_segment_cli_options(monkeypatch):
     assert args.membrane_channels == "CD3,CD20"
     assert args.postprocessing_mode == "legacy"
     assert args.fill_gaps
+    assert args.membrane_mode == "max"
+    assert args.whole_cell_threshold == 0.05
+    assert args.min_cell_area == 15.0
+    assert args.min_nucleus_area is None
+    assert args.qc and not args.save_maps
+    assert args.output_dir is None
+    args = build_cli("segment").parse_args(
+        ["--membrane-mode", "mean", "--no-qc", "--save-maps", "--output-dir", "out", "a.tiff"]
+    )
+    assert args.membrane_mode == "mean"
+    assert not args.qc and args.save_maps
+    assert args.output_dir.name == "out"
+
+
+def test_membrane_image_max_mode():
+    stack, _, _ = make_stack()
+    kwargs = dict(membrane_channels=["CD45", "CD3"], normalization="percentile")
+    cyto = prepare_stack(stack, LABELS, "cytoplasm", membrane_mode="max", **kwargs)
+    expected = np.maximum(percentile_normalize(stack[3]), percentile_normalize(stack[4]))
+    np.testing.assert_allclose(cyto, expected)
+    assert (cyto >= prepare_stack(stack, LABELS, "cytoplasm", **kwargs) - 1e-12).all()
+
+
+def test_mesmer_sizes_given_in_um2():
+    cell, nuc = mesmer_postprocess_kwargs(whole_cell_threshold=0.05, min_cell_area=15)
+    assert cell == dict(
+        interior_threshold=0.05, small_objects_threshold=60, fill_holes_threshold=60
+    )
+    assert nuc == dict()
+    cell, nuc = mesmer_postprocess_kwargs(min_cell_area=0, min_nucleus_area=4)
+    assert cell == dict()
+    assert nuc == dict(small_objects_threshold=16, fill_holes_threshold=16)
+
+
+@pytest.fixture
+def mesmer_calls(monkeypatch):
+    """Fake Mesmer recording its settings, with per-pixel outputs at its own scale."""
+    calls = list()
+
+    class FakeMesmer:
+        def _postprocess(self, output, **kwargs):
+            shape = output["whole-cell"][0].shape[1:3]
+            return np.ones((1,) + shape + (2,), dtype=np.int32)
+
+        def predict(self, image, image_mpp=None, compartment="whole-cell", **kwargs):
+            calls.append(dict(image_mpp=image_mpp, **kwargs))
+            f = int(round(image_mpp / 0.5)) if image_mpp else 1
+            shape = (1, image.shape[1] * f, image.shape[2] * f, 1)
+            output = {
+                "whole-cell": [np.full(shape, 0.1), np.full(shape, 0.2)],
+                "nuclear": [np.full(shape, 0.3), np.full(shape, 0.4)],
+            }
+            return self._postprocess(output)[:, ::f, ::f]
+
+    applications = types.ModuleType("deepcell.applications")
+    applications.MultiplexSegmentation = FakeMesmer
+    applications.NuclearSegmentation = FakeMesmer
+    applications.CytoplasmSegmentation = FakeMesmer
+    deepcell = types.ModuleType("deepcell")
+    deepcell.applications = applications
+    monkeypatch.setitem(sys.modules, "deepcell", deepcell)
+    monkeypatch.setitem(sys.modules, "deepcell.applications", applications)
+    return calls
+
+
+def test_deepcell_gets_mesmer_settings(mesmer_calls):
+    cell, nuc = mesmer_postprocess_kwargs(0.05, 15, None)
+    image = to_deepcell_input(np.random.rand(2, 30, 40))
+    deepcell_segment(
+        image,
+        "both",
+        image_mpp=1.0,
+        postprocess_kwargs_whole_cell=cell,
+        postprocess_kwargs_nuclear=nuc,
+    )
+    assert mesmer_calls[0]["postprocess_kwargs_whole_cell"] == cell
+    assert "postprocess_kwargs_nuclear" not in mesmer_calls[0]
+
+
+def test_mesmer_maps_are_returned(mesmer_calls):
+    image = to_deepcell_input(np.random.rand(2, 30, 40))
+    pred, maps = deepcell_segment(image, "both", image_mpp=1.0, return_maps=True)
+    assert pred.shape == (30, 40, 2)
+    assert maps.shape == (len(MESMER_MAPS), 30, 40)
+    np.testing.assert_allclose(maps[:, 10, 10], [0.2, 0.1, 0.4, 0.3], atol=1e-6)
+
+
+class FakeROIWithFiles(FakeROI):
+    def __init__(self, stack, labels, folder):
+        super().__init__(stack, labels)
+        self.folder = folder
+
+    def get_input_filename(self, name):
+        from imc.types import Path
+
+        files = dict(
+            stack="x_full.tiff", cell_mask="x_full_mask.tiff", nuclei_mask="x_full_nucmask.tiff"
+        )
+        return Path(self.folder) / files[name]
+
+
+def test_segment_roi_writes_outputs_to_folder(mesmer_calls, tmp_path):
+    stack, _, _ = make_stack()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    out = segment_roi(
+        FakeROIWithFiles(stack, LABELS, raw),
+        model="deepcell",
+        compartment="both",
+        membrane_channels=["CD45", "CD3"],
+        plot_segmentation=False,
+        save_maps=True,
+        output_dir=tmp_path / "new",
+    )
+    assert mesmer_calls[0]["postprocess_kwargs_whole_cell"]["interior_threshold"] == 0.05
+    assert mesmer_calls[0]["postprocess_kwargs_whole_cell"]["small_objects_threshold"] == 60
+    assert sorted(p.name for p in (tmp_path / "new").iterdir()) == [
+        "x_full_cell_qc.csv",
+        "x_full_mask.tiff",
+        "x_full_mesmer_input.tiff",
+        "x_full_mesmer_maps.tiff",
+        "x_full_nucmask.tiff",
+    ]
+    assert list(raw.iterdir()) == []
+    assert set(out) == {"cell", "nuclei", "cell_qc", "mesmer_maps"}
+
+
+# Quality control after pairing
+def scene_with_split_nucleus(dip=False):
+    """Three whole nuclei, and one nucleus cut in two by a cell border."""
+    shape = (40, 100)
+    cell = np.zeros(shape, int)
+    nuc = np.zeros(shape, int)
+    cell[5:35, 5:20] = 1
+    cell[5:35, 20:35] = 2
+    nuc[disk(shape, (20, 20), 7)] = 1
+    nuc[(nuc == 1) & (cell == 2)] = 2
+    for i, x in enumerate([50, 70, 90], 3):
+        cell[5:35, x - 9 : x + 9] = i
+        nuc[disk(shape, (20, x), 7)] = i
+    dna = (nuc > 0) * 100.0
+    if dip:
+        dna[:, 19:21] = 20
+    return np.stack([cell, nuc], -1), dna
+
+
+def test_nucleus_split_in_two_is_merged():
+    mask, dna = scene_with_split_nucleus()
+    out, table = qc_cell_and_nuclear_masks(mask, dna)
+    check_pairing(out)
+    assert out[..., 0].max() == 4
+    assert out[20, 15, 0] == out[20, 25, 0]
+    assert table["merged_pieces"].tolist() == [2, 1, 1, 1]
+    assert (out[..., 1] > 0).sum() == (mask[..., 1] > 0).sum()
+
+
+def test_nuclei_with_a_dna_dip_are_not_merged():
+    mask, dna = scene_with_split_nucleus(dip=True)
+    out, table = qc_cell_and_nuclear_masks(mask, dna)
+    check_pairing(out)
+    assert out[..., 0].max() == 5
+    assert (table["merged_pieces"] == 1).all()
+
+
+def test_small_cells_removed_and_partial_nuclei_flagged():
+    cell = np.zeros(SHAPE, int)
+    nuc = np.zeros(SHAPE, int)
+    cell[5:25, 5:25] = 1
+    nuc[disk(SHAPE, (15, 15), 6)] = 1
+    cell[5:25, 30:50] = 2
+    nuc[14:17, 39:42] = 2
+    cell[30:33, 30:33] = 3
+    cell[28:38, 5:20] = 4
+    mask = np.stack([cell, nuc], -1)
+    out, table = qc_cell_and_nuclear_masks(mask, np.zeros(SHAPE), min_cell_area=15)
+    check_pairing(out)
+    assert out[..., 0].max() == 3
+    assert table["has_nucleus"].tolist() == [True, True, False]
+    assert table["partial_nucleus"].tolist() == [False, True, False]

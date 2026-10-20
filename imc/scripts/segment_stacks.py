@@ -50,6 +50,8 @@ def main(cli: tp.Sequence[str] = None) -> int:
             )
             for layer in layers[args.compartment]
         }
+        if args.output_dir is not None:
+            mask_files = {k: args.output_dir / v.name for k, v in mask_files.items()}
         exists = all(f.exists() for f in mask_files.values())
         if exists and not args.overwrite:
             print(f"Mask for '{roi}' already exists, skipping...")
@@ -72,6 +74,14 @@ def main(cli: tp.Sequence[str] = None) -> int:
                 postprocessing_mode=args.postprocessing_mode,
                 fill_gaps=args.fill_gaps,
                 output_mask_suffix=args.output_mask_suffix,
+                membrane_mode=args.membrane_mode,
+                whole_cell_threshold=args.whole_cell_threshold,
+                min_cell_area=args.min_cell_area,
+                min_nucleus_area=args.min_nucleus_area,
+                qc=args.qc,
+                partial_nucleus_area=args.partial_nucleus_area,
+                save_maps=args.save_maps,
+                output_dir=args.output_dir,
             )
         except ValueError as e:
             print("Error segmenting stack. Perhaps XY shape is not compatible?")
