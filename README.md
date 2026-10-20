@@ -15,6 +15,28 @@ Above all, it is a tool for the use of IMC data at scale.
 Development is still underway, so use at your own risk.
 
 
+## Segmentation changes in this fork
+
+`imc segment` in this fork differs from [ElementoLab/imc](https://github.com/ElementoLab/imc) as follows:
+
+- **Pixel size.** Images are passed to DeepCell (Mesmer) at full resolution together with their pixel size (`--image-mpp`, default 1.0 µm). Mesmer was trained at 0.5 µm per pixel and rescales its input accordingly.
+- **Membrane image.** When segmenting from the stack, the membrane image is the mean of the antibody channels except Ki67 and SMA, or of the markers given with `--membrane-channels`.
+- **Pairing of cells and nuclei** (`--post-processing align`, default). No object is removed: a cell holding several nuclei is divided between them, a nucleus spanning several cells is given to the cell holding most of it (more than 80%) or divided along the cell border, a nucleus outside all cells becomes a cell, and a cell without a nucleus has no nucleus in the nuclear mask. `--post-processing legacy` applies the original rules.
+- **Gap filling** (`--fill-gaps`, optional). Nuclei visible in the DNA channels but not covered by any cell are added as cells.
+- Label masks are resized with nearest-neighbour interpolation, and `--output-mask-suffix` is applied to the mask file names.
+
+Example:
+```bash
+imc segment \
+  --model deepcell --compartment both \
+  --membrane-channels CD20,HLADR,CD3,CD4,CD8a,CD45RO,CD38,CD68,CD14,CD11b,CD11c,CD16,CD31,CD56,CD27,CD123 \
+  --output-mask-suffix _v2 \
+  processed/*/tiffs/*_full.tiff
+```
+
+Masks of the original package are reproduced with `imc segment --from-probabilities --model deepcell --compartment both --image-mpp 0.5 --post-processing legacy`.
+
+
 ## Requirements and installation
 
 Requires `Python >= 3.9`. `imc` uses a `pyproject.toml` configuration only, so you'll need a up-to-date version of `pip` before installing. Base packages as `gcc` and `g++` will also need to be installed on system using the command `sudo apt install g++` or likewise. We also highly recommend installing the package on a `conda` environment to avoid dependency issues.

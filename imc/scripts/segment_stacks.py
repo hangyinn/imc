@@ -39,17 +39,17 @@ def main(cli: tp.Sequence[str] = None) -> int:
         roi.set_channel_exclude(args.channel_exclude.split(","))
         rois.append(roi)
 
+    membrane_channels = [c for c in args.membrane_channels.split(",") if c]
+    layers = {"both": ["cell", "nuclei"], "nuclear": ["nuclei"], "cytoplasm": ["cell"]}
+
     # Run segmentation
     for roi in rois:
-        if args.compartment == "both":
-            mask_files = {
-                "cell": roi.get_input_filename("cell_mask"),
-                "nuclei": roi.get_input_filename("nuclei_mask"),
-            }
-        else:
-            mask_files = {
-                args.compartment: roi.get_input_filename(args.compartment + "_mask")
-            }
+        mask_files = {
+            layer: roi.get_input_filename(layer + "_mask").replace_(
+                ".tiff", args.output_mask_suffix + ".tiff"
+            )
+            for layer in layers[args.compartment]
+        }
         exists = all(f.exists() for f in mask_files.values())
         if exists and not args.overwrite:
             print(f"Mask for '{roi}' already exists, skipping...")
@@ -67,6 +67,11 @@ def main(cli: tp.Sequence[str] = None) -> int:
                 overwrite=args.overwrite,
                 plot_segmentation=args.plot,
                 verbose=not args.quiet,
+                image_mpp=args.image_mpp,
+                membrane_channels=membrane_channels,
+                postprocessing_mode=args.postprocessing_mode,
+                fill_gaps=args.fill_gaps,
+                output_mask_suffix=args.output_mask_suffix,
             )
         except ValueError as e:
             print("Error segmenting stack. Perhaps XY shape is not compatible?")

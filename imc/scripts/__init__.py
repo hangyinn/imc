@@ -591,6 +591,48 @@ cli_config = {
                 },
             },
             {
+                "args": ["--post-processing"],
+                "kwargs": {
+                    "dest": "postprocessing_mode",
+                    "choices": ["align", "legacy"],
+                    "default": "align",
+                    "help": "How cell and nuclear masks are paired when using compartment 'both'. "
+                    "'align' keeps all objects: cells with several nuclei are divided between them "
+                    "and shared nuclei are given to one cell or divided. "
+                    "'legacy' removes such cells and fills cells without nucleus with a placeholder. "
+                    "Default is 'align'.",
+                },
+            },
+            {
+                "args": ["--image-mpp"],
+                "kwargs": {
+                    "dest": "image_mpp",
+                    "type": float,
+                    "default": 1.0,
+                    "help": "Pixel size of the images in micrometres, used to rescale images "
+                    "to the resolution of the DeepCell model (0.5 um/px). Default is 1.0 (IMC).",
+                },
+            },
+            {
+                "args": ["--membrane-channels"],
+                "kwargs": {
+                    "dest": "membrane_channels",
+                    "default": "",
+                    "help": "Comma-delimited list of markers combined into the membrane image "
+                    "when segmenting from the stack (not from probabilities), e.g. 'CD45,CD3,CD20'. "
+                    "Default is all antibody channels except nuclear ones, Ki67 and SMA.",
+                },
+            },
+            {
+                "args": ["--fill-gaps"],
+                "kwargs": {
+                    "dest": "fill_gaps",
+                    "action": "store_true",
+                    "help": "Whether to add cells for nuclei found in the DNA channels "
+                    "outside all cells. Only used with '--post-processing align'.",
+                },
+            },
+            {
                 "args": ["--verbose"],
                 "kwargs": {
                     "dest": "quiet",

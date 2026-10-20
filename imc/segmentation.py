@@ -36,36 +36,89 @@ def normalize(image: Array, mode: str = "cyx") -> Array:
     raise ValueError("Unknown image shape.")
 
 
+def percentile_normalize(image: Array, lower: float = 1.0, upper: float = 99.8) -> Array:
+    """Scale each channel of a YX or CYX image to [0, 1] between two percentiles."""
+    if len(image.shape) == 2:
+        lo, hi = np.percentile(image, [lower, upper])
+        return np.clip((image - lo) / max(hi - lo, 1e-9), 0, 1)
+    if len(image.shape) == 3:
+        return np.asarray([percentile_normalize(x, lower, upper) for x in image])
+    raise ValueError("Unknown image shape.")
+
+
+def marker_names(channel_labels: Series) -> Series:
+    """Marker part of channel labels, e.g. 'CD20(Dy161)' -> 'CD20'."""
+    return channel_labels.str.replace(r"\(.*$", "", regex=True).str.strip()
+
+
 def prepare_stack(
     stack: Array,
     channel_labels: Series,
     compartment: str = "nuclear",
     channel_exclude: Series = None,
+    membrane_channels: tp.Sequence[str] = None,
+    normalization: str = "equalize",
 ) -> Array:
+    """
+    Make the nuclear and/or membrane image used as segmentation input.
+
+    Parameters
+    ----------
+    stack: Array
+        Channel stack of shape (C, Y, X).
+    channel_labels: Series
+        Labels of the channels in ``stack``, e.g. 'CD20(Dy161)'.
+    compartment: str
+        One of ``nuclear``, ``cytoplasm`` or ``both``.
+    channel_exclude: Series
+        Boolean Series marking channels to exclude.
+    membrane_channels: list[str]
+        Markers averaged into the membrane (cytoplasm) image, matched to the part
+        of the channel label before the metal tag. By default, all channels with an
+        antibody are used except the nuclear channels, Ki67 and SMA.
+    normalization: str
+        ``equalize`` (histogram equalization, the input of the ilastik model) or
+        ``percentile`` (scaling between the 1st and 99.8th percentiles).
+    """
     assert compartment in ["nuclear", "cytoplasm", "both"]
+    assert normalization in ["equalize", "percentile"]
+    norm = normalize if normalization == "equalize" else percentile_normalize
 
     if channel_exclude is not None:
-        stack = stack[~channel_exclude]
-        channel_labels = channel_labels[~channel_exclude.values]
+        keep = ~np.asarray(channel_exclude, dtype=bool)
+        stack = stack[keep]
+        channel_labels = channel_labels[keep]
 
     # Get nuclear channels
     nuclear_chs = (
         channel_labels.str.contains(r"DNA|Iridium", regex=True)
         | channel_labels.str.contains("191Ir(Ir191)", regex=False)
         | channel_labels.str.contains("193Ir(Ir193)", regex=False)
-    )
+    ).values
     if nuclear_chs.sum() == 0:
         raise ValueError(
             "Could not determine nuclear channels using 'DNA', 'Iridium', or Ir91/Ir193."
         )
 
-    nucl = normalize(stack[nuclear_chs]).mean(0)
+    nucl = norm(stack[nuclear_chs]).mean(0)
     if compartment == "nuclear":
         return nucl
 
-    # Get cytoplasmatic channels
-    cyto_chs = ~(nuclear_chs | channel_labels.str.contains(r"Ki67|SMA", regex=True))
-    cyto = normalize(stack[~cyto_chs]).mean(0)
+    # Get membrane/cytoplasm channels
+    if membrane_channels:
+        names = marker_names(channel_labels)
+        missing = [m for m in membrane_channels if m not in names.values]
+        if missing:
+            print(f"Membrane channels not found in stack and skipped: {missing}")
+        cyto_chs = names.isin(list(membrane_channels)).values
+        if cyto_chs.sum() == 0:
+            raise ValueError("None of the membrane channels were found in the stack.")
+    else:
+        # channels without an antibody are labeled by mass only, e.g. '80ArAr(ArAr80)'
+        no_antibody = channel_labels.str.match(r"^\d").values
+        other = channel_labels.str.contains(r"Ki67|SMA", regex=True).values
+        cyto_chs = ~(nuclear_chs | no_antibody | other)
+    cyto = norm(stack[cyto_chs]).mean(0)
     if compartment == "cytoplasm":
         return cyto
 
@@ -249,7 +302,7 @@ def stardist_segment_nuclei(image: Array, model_str: str = "2D_versatile_fluo") 
 
 
 def deepcell_resize_to_predict_shape(image: Array) -> Array:
-    # new version requires fixed 256x256 size
+    """Resize an image to 256x256. Not used: DeepCell tiles images of any size."""
     if len(image.shape) == 2:
         return resize(image, (256, 256))[np.newaxis, :, :, np.newaxis]
     if len(image.shape) == 3:
@@ -257,6 +310,25 @@ def deepcell_resize_to_predict_shape(image: Array) -> Array:
             np.newaxis, ...
         ]
     raise ValueError("Image with unknown shape.")
+
+
+def to_deepcell_input(image: Array) -> Array:
+    """Reshape a YX or CYX image to the BYXC shape expected by DeepCell."""
+    if len(image.shape) == 2:
+        return image[np.newaxis, :, :, np.newaxis]
+    if len(image.shape) == 3:
+        return np.moveaxis(image, 0, -1)[np.newaxis, ...]
+    raise ValueError("Image with unknown shape.")
+
+
+def resize_labels(mask: Array, shape: tp.Tuple[int, ...]) -> Array:
+    """Resize a label mask with nearest-neighbour interpolation, keeping label values."""
+    if tuple(mask.shape) == tuple(shape):
+        return mask
+    out = resize(
+        mask, shape, order=0, preserve_range=True, anti_aliasing=False, mode="edge"
+    )
+    return out.astype(mask.dtype)
 
 
 def split_image_into_tiles(
@@ -372,8 +444,8 @@ def deepcell_segment(
         #     ).squeeze()
         # pred = join_tiles_to_image(preds)
 
-    if len(pred.shape) == 4:
-        pred = resize(pred, image.shape[1:])
+    if pred.shape[:2] != image.shape[1:3]:
+        pred = resize_labels(pred, image.shape[1:3] + pred.shape[2:])
     return pred
 
 
@@ -584,8 +656,23 @@ def plot_image_and_mask(image: Array, mask_dict: tp.Dict[str, Array]) -> Figure:
     return fig
 
 
-def deepcell_segment_probabilities(probabilities: Array, compartment: str) -> Array:
-    """"""
+def deepcell_segment_probabilities(
+    probabilities: Array, compartment: str, image_mpp: float = 1.0
+) -> Array:
+    """
+    Segment ilastik probabilities (YXC: nuclear, cytoplasm, background) with the
+    DeepCell MultiplexSegmentation (Mesmer) model.
+
+    Parameters
+    ----------
+    probabilities: Array
+        Probability array of shape (Y, X, 3).
+    compartment: str
+        One of ``cell``, ``cytoplasm``, ``nuclear`` or ``both``.
+    image_mpp: float
+        Pixel size of ``probabilities`` in micrometres. Mesmer was trained at
+        0.5 um/px and rescales the input by ``image_mpp / 0.5``.
+    """
     from deepcell.applications import MultiplexSegmentation
 
     # translate compartments
@@ -598,7 +685,9 @@ def deepcell_segment_probabilities(probabilities: Array, compartment: str) -> Ar
 
     app = MultiplexSegmentation()
     pred: Array = app.predict(
-        probabilities[np.newaxis, ..., :-1], compartment=imc2dc[compartment]
+        probabilities[np.newaxis, ..., :-1],
+        image_mpp=image_mpp,
+        compartment=imc2dc[compartment],
     )
     return pred.squeeze()
 
@@ -616,7 +705,10 @@ def deepcell_postprocess_both_compartments(
     the MultiplexSegmentation model with the 'both' compartment.
 
     The major goal is the alignment of the cellular and nuclear masks
-    as much as possible.
+    as much as possible. Cells overlapping several nuclei without a dominant one,
+    and cells sharing a nucleus without a dominant cell, are removed; cells without
+    a nucleus get the cell area minus its border as nucleus. Kept to reproduce
+    earlier masks; ``align_cell_and_nuclear_masks`` keeps all objects.
     """
     import seaborn as sns
     from skimage.segmentation import find_boundaries
@@ -695,7 +787,6 @@ def deepcell_postprocess_both_compartments(
                     else:
                         m = cell_mask == cell
                         cell_mask[cell_mask == cell] = 0
-                        m = m | (np.isin(cell_mask, props.keys()))
                         rem = np.unique(nuclei_mask[m])
                         nuclei_mask[np.isin(nuclei_mask, rem)] = 0
                         n_removed += 1
@@ -704,7 +795,7 @@ def deepcell_postprocess_both_compartments(
             it += 1
         return cell_mask, nuclei_mask
 
-    if (mask.ndim != 3) and (mask.shape[-1] != 2):
+    if (mask.ndim != 3) or (mask.shape[-1] != 2):
         raise ValueError(
             "Array must contain more than one segmentation layer of shape "
             "(X,Y,2), the last dimension assumed to be cell and nuclei."
@@ -855,6 +946,231 @@ def deepcell_postprocess_both_compartments(
     return np.moveaxis(np.stack([cell_mask, nuclei_mask]), 0, -1)
 
 
+def _label_overlaps(a: Array, b: Array) -> pd.DataFrame:
+    """Number of pixels shared by each pair of overlapping labels in two masks."""
+    sel = (a > 0) & (b > 0)
+    nb = int(b.max()) + 1
+    key = a[sel].astype(np.int64) * nb + b[sel].astype(np.int64)
+    u, n = np.unique(key, return_counts=True)
+    return pd.DataFrame({"a": u // nb, "b": u % nb, "n": n})
+
+
+def _keep_largest_piece(labels: Array) -> Array:
+    """Keep only the largest connected piece of each label."""
+    from skimage.measure import label as label_pieces
+
+    pieces = label_pieces(labels, background=0, connectivity=1)
+    if pieces.max() == 0:
+        return labels
+    sel = pieces > 0
+    df = pd.DataFrame({"piece": pieces[sel], "label": labels[sel]})
+    df = df.drop_duplicates("piece")
+    df["size"] = np.bincount(pieces.ravel())[df["piece"].values]
+    largest = df.sort_values("size", ascending=False).drop_duplicates("label")
+    keep = np.zeros(pieces.max() + 1, dtype=bool)
+    keep[largest["piece"].values] = True
+    out = labels.copy()
+    out[~keep[pieces]] = 0
+    return out
+
+
+def align_cell_and_nuclear_masks(
+    mask: Array,
+    dominant_nuclei_threshold: float = 0.8,
+    min_nucleus_area: int = 10,
+    nucleus_expansion: int = 2,
+    nuclear_image: Array = None,
+    fill_gaps: bool = False,
+    verbose: bool = False,
+) -> Array:
+    """
+    Pair the cell and nuclear masks of the DeepCell MultiplexSegmentation model
+    ('both' compartment) one to one without discarding objects.
+
+    Rules, in order:
+        1. A nucleus overlapping several cells is given whole to the cell holding
+           more than ``dominant_nuclei_threshold`` of it; otherwise it is divided
+           along the cell borders. Cells are extended to contain their nucleus.
+        2. A nucleus outside all cells becomes a cell: the nucleus expanded by
+           ``nucleus_expansion`` pixels into unassigned pixels.
+        3. Nuclei within one cell are merged into the largest one if it holds more
+           than ``dominant_nuclei_threshold`` of their area. Otherwise the cell is
+           divided between its nuclei by seeded watershed. Nuclear fragments smaller
+           than ``min_nucleus_area`` pixels in such cells are dropped.
+        4. Cells without a nucleus are kept, with no nucleus (0 in the nuclear mask).
+        5. If ``fill_gaps``, nuclei found in ``nuclear_image`` (DNA) in pixels not
+           covered by any cell are added as cells, expanded as in rule 2.
+
+    Nuclei take the label of their cell and labels are made consecutive.
+
+    Parameters
+    ----------
+    mask: Array
+        Array of shape (Y, X, 2) with the cell and nuclear masks.
+    nuclear_image: Array
+        DNA image of shape (Y, X); only used if ``fill_gaps``.
+
+    Returns
+    -------
+    Array of shape (Y, X, 2) with the cell and nuclear masks.
+    """
+    from skimage.segmentation import watershed, expand_labels, relabel_sequential
+
+    if (mask.ndim != 3) or (mask.shape[-1] != 2):
+        raise ValueError("Mask must have shape (Y, X, 2) with cell and nuclear masks.")
+
+    cell = relabel_sequential(mask[..., 0].astype(np.int64))[0]
+    nuc = relabel_sequential(mask[..., 1].astype(np.int64))[0]
+    stats = {"cells_in": int(cell.max()), "nuclei_in": int(nuc.max())}
+
+    # 1. Nuclei overlapping several cells
+    ov = _label_overlaps(nuc, cell).rename(columns={"a": "nucleus", "b": "cell"})
+    ov["share"] = ov["n"] / ov.groupby("nucleus")["n"].transform("sum")
+    top = ov.sort_values("share", ascending=False).drop_duplicates("nucleus")
+    shared = ov.groupby("nucleus").size()
+    shared = shared.index[shared > 1]
+    dominant = top[top["share"] > dominant_nuclei_threshold]
+    divided = top.loc[top["share"] <= dominant_nuclei_threshold, "nucleus"].values
+    stats["nuclei_given_to_one_cell"] = int(dominant["nucleus"].isin(shared).sum())
+    stats["nuclei_divided"] = len(divided)
+
+    owner = np.zeros(nuc.max() + 1, dtype=np.int64)
+    owner[dominant["nucleus"].values] = dominant["cell"].values
+    sel = owner[nuc] > 0
+    cell[sel] = owner[nuc[sel]]
+
+    is_divided = np.zeros(nuc.max() + 1, dtype=bool)
+    is_divided[divided] = True
+    sel = is_divided[nuc]
+    nuc[sel & (cell == 0)] = 0
+    sel = sel & (cell > 0)
+    if sel.any():
+        key = nuc[sel] * (cell.max() + 1) + cell[sel]
+        _, inv = np.unique(key, return_inverse=True)
+        nuc[sel] = nuc.max() + 1 + inv.ravel()
+
+    # 2. Nuclei outside all cells
+    orphans = np.setdiff1d(np.arange(1, stats["nuclei_in"] + 1), ov["nucleus"].values)
+    stats["nuclei_made_cells"] = len(orphans)
+    if len(orphans):
+        grown = expand_labels(np.where(np.isin(nuc, orphans), nuc, 0), nucleus_expansion)
+        free = (grown > 0) & (cell == 0)
+        cell[free] = grown[free] + cell.max()
+
+    cell = _keep_largest_piece(cell)
+    nuc[cell == 0] = 0
+
+    # 3. Cells with several nuclei
+    ov = _label_overlaps(cell, nuc).rename(columns={"a": "cell", "b": "nucleus"})
+    ov = ov.sort_values("n", ascending=False).drop_duplicates("nucleus")
+    ov["area"] = np.bincount(nuc.ravel())[ov["nucleus"].values]
+    n_per_cell = ov.groupby("cell").size()
+    multi = ov[ov["cell"].isin(n_per_cell.index[n_per_cell > 1])]
+    relabel = np.arange(nuc.max() + 1)
+    to_split = dict()
+    for c, g in multi.groupby("cell"):
+        g = g.sort_values("area", ascending=False)
+        big = g[g["area"] >= min_nucleus_area]
+        largest_share = g["area"].iloc[0] / g["area"].sum()
+        if (len(big) >= 2) and (largest_share <= dominant_nuclei_threshold):
+            to_split[c] = big["nucleus"].values
+            relabel[g.loc[g["area"] < min_nucleus_area, "nucleus"].values] = 0
+        else:
+            relabel[g["nucleus"].values] = g["nucleus"].iloc[0]
+    nuc = relabel[nuc]
+    stats["cells_nuclei_merged"] = multi["cell"].nunique() - len(to_split)
+    stats["cells_divided"] = len(to_split)
+
+    if to_split:
+        objs = ndi.find_objects(cell)
+        next_label = cell.max() + 1
+        for c, seeds in to_split.items():
+            sl = objs[c - 1]
+            region = cell[sl] == c
+            markers = np.where(region & np.isin(nuc[sl], seeds), nuc[sl], 0)
+            distance = ndi.distance_transform_edt(markers == 0)
+            parts = watershed(distance, markers, mask=region)
+            sub = cell[sl]
+            for s in seeds:
+                sub[parts == s] = next_label
+                next_label += 1
+
+    # 5. Nuclei in uncovered pixels
+    stats["cells_added_from_dna"] = 0
+    if fill_gaps:
+        if (nuclear_image is None) or (nuclear_image.shape != cell.shape):
+            print("No DNA image of matching shape given; gaps were not filled.")
+        else:
+            new_nuc = _detect_nuclei_in_gaps(
+                nuclear_image, cell, nuc, min_nucleus_area=min_nucleus_area
+            )
+            if new_nuc.max() > 0:
+                grown = expand_labels(new_nuc, nucleus_expansion)
+                free = (grown > 0) & (cell == 0)
+                cell[free] = grown[free] + cell.max()
+                sel = (new_nuc > 0) & (cell > 0)
+                nuc[sel] = new_nuc[sel] + nuc.max()
+            stats["cells_added_from_dna"] = int(new_nuc.max())
+
+    # Align nuclear labels to cell labels and make labels consecutive
+    nuc[cell == 0] = 0
+    cell = relabel_sequential(cell)[0]
+    nuc = np.where(nuc > 0, cell, 0)
+    stats["cells_out"] = int(cell.max())
+    stats["cells_without_nucleus"] = int(cell.max() - (len(np.unique(nuc)) - 1))
+    if verbose:
+        print("Cell-nucleus pairing: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    return np.stack([cell, nuc], axis=-1).astype(np.uint32)
+
+
+def _detect_nuclei_in_gaps(
+    nuclear_image: Array,
+    cell_mask: Array,
+    nuclei_mask: Array,
+    min_nucleus_area: int = 10,
+    quantile: float = 0.1,
+    sigma: float = 1.0,
+    min_distance: int = 3,
+) -> Array:
+    """
+    Detect nuclei in pixels not covered by any cell.
+
+    Pixels are called nuclear if the smoothed DNA signal exceeds the ``quantile``
+    of the mean signal of the existing nuclei; touching nuclei are separated by
+    watershed on the distance transform. Objects smaller than ``min_nucleus_area``
+    or larger than four times the median nuclear area are discarded.
+    """
+    from skimage.feature import peak_local_max
+    from skimage.filters import threshold_otsu
+    from skimage.segmentation import watershed, relabel_sequential
+
+    dna = ndi.gaussian_filter(nuclear_image.astype(float), sigma)
+    ids = np.unique(nuclei_mask)
+    ids = ids[ids > 0]
+    if len(ids) >= 10:
+        threshold = np.quantile(ndi.mean(dna, labels=nuclei_mask, index=ids), quantile)
+        max_area = 4 * np.median(np.bincount(nuclei_mask.ravel())[ids])
+    else:
+        threshold = threshold_otsu(dna)
+        max_area = np.inf
+    candidate = ndi.binary_opening((dna > threshold) & (cell_mask == 0))
+    if not candidate.any():
+        return np.zeros(cell_mask.shape, dtype=np.int64)
+    dist = ndi.distance_transform_edt(candidate)
+    pieces = ndi.label(candidate)[0]
+    peaks = peak_local_max(
+        dist, min_distance=min_distance, labels=pieces, exclude_border=False
+    )
+    markers = np.zeros(cell_mask.shape, dtype=np.int64)
+    markers[tuple(peaks.T)] = np.arange(1, len(peaks) + 1)
+    nuclei = watershed(-dist, markers, mask=candidate)
+    area = np.bincount(nuclei.ravel())
+    keep = (area >= min_nucleus_area) & (area <= max_area)
+    keep[0] = False
+    nuclei[~keep[nuclei]] = 0
+    return relabel_sequential(nuclei)[0]
+
+
 def segment_roi(
     roi: _roi.ROI,
     from_probabilities: bool = False,
@@ -865,6 +1181,11 @@ def segment_roi(
     overwrite: bool = True,
     plot_segmentation: bool = True,
     verbose: bool = False,
+    image_mpp: float = 1.0,
+    membrane_channels: tp.Sequence[str] = None,
+    postprocessing_mode: str = "align",
+    fill_gaps: bool = False,
+    output_mask_suffix: str = "",
 ) -> tp.Dict[str, Array]:
     """
     Segment the area of an ROI.
@@ -875,26 +1196,66 @@ def segment_roi(
         ROI object to process.
     from_probabilities: bool
         Whether to use the probability array instead of the channel stack.
-        If true, only the "deepcell" ``model`` can be used and the ``compartment``
-        must be "cytoplasm".
+        If true, only the "deepcell" ``model`` can be used.
     model: str
-        One of ``deepcell`` or ``stardist``.
+        One of ``deepcell``, ``stardist`` or ``cellpose``.
     compartment: str
         One of ``nuclear``, ``cytoplasm``, or ``both``.
+    postprocessing: bool
+        Whether to pair cell and nuclear masks when ``compartment`` is ``both``.
     save: bool
         Whether to save the outputs to disk.
     overwrite: bool
         Whether to overwrite files when ``save`` is True.
     plot_segmentation: bool
         Whether to make a figure illustrating the segmentation.
+    image_mpp: float
+        Pixel size of the stack in micrometres (1.0 for IMC), passed to DeepCell.
+    membrane_channels: list[str]
+        Markers combined into the membrane image when segmenting from the stack.
+        See ``prepare_stack``.
+    postprocessing_mode: str
+        ``align`` (``align_cell_and_nuclear_masks``) or ``legacy``
+        (``deepcell_postprocess_both_compartments``).
+    fill_gaps: bool
+        Whether to add cells for nuclei found in the DNA channels outside all cells.
+        Only used with ``postprocessing_mode`` ``align``.
+    output_mask_suffix: str
+        Suffix added to the mask file names, e.g. '_v2' writes '<roi>_full_mask_v2.tiff'.
     """
+    assert postprocessing_mode in ["align", "legacy"]
     if from_probabilities:
         assert model in ["deepcell"]
         image = roi.probabilities
+        # probabilities are predicted on a 2x upscaled image: return to the stack grid
         shape = tuple([int(x / 2) for x in image.shape[1:]])
         image = resize(image / image.max(), (3,) + shape)
-        mask = deepcell_segment_probabilities(np.moveaxis(image, 0, -1), compartment)
-        if postprocessing and compartment in ["both"]:
+        mask = deepcell_segment_probabilities(
+            np.moveaxis(image, 0, -1), compartment, image_mpp=image_mpp
+        )
+    else:
+        assert model in ["deepcell", "stardist", "cellpose"]
+        image = prepare_stack(
+            roi.stack,
+            roi.channel_labels,
+            compartment,
+            roi.channel_exclude,
+            membrane_channels=membrane_channels,
+            normalization="percentile" if model == "deepcell" else "equalize",
+        )
+        if model == "stardist":
+            assert compartment == "nuclear"
+            mask = stardist_segment_nuclei(image)
+
+        elif model == "deepcell":
+            mask = deepcell_segment(
+                to_deepcell_input(image), compartment=compartment, image_mpp=image_mpp
+            )
+        elif model == "cellpose":
+            mask = cellpose_segment(image, compartment)
+
+    if postprocessing and compartment in ["both"]:
+        if postprocessing_mode == "legacy":
             mask = deepcell_postprocess_both_compartments(
                 mask,
                 plot=False,
@@ -904,27 +1265,19 @@ def segment_roi(
                 ),
                 verbose=verbose,
             )
-    else:
-        assert model in ["deepcell", "stardist", "cellpose"]
-        image = prepare_stack(
-            roi.stack, roi.channel_labels, compartment, roi.channel_exclude
-        )
-        if model == "stardist":
-            assert compartment == "nuclear"
-            mask = stardist_segment_nuclei(image)
-
-        elif model == "deepcell":
-            input_image = deepcell_resize_to_predict_shape(image)
-            image_mpp = (np.asarray(image.shape) / 256).mean()
-            mask = deepcell_segment(
-                input_image, compartment=compartment, image_mpp=image_mpp
+        else:
+            dna = None
+            if fill_gaps:
+                dna = prepare_stack(
+                    roi.stack,
+                    roi.channel_labels,
+                    "nuclear",
+                    roi.channel_exclude,
+                    normalization="percentile",
+                )
+            mask = align_cell_and_nuclear_masks(
+                mask, nuclear_image=dna, fill_gaps=fill_gaps, verbose=verbose
             )
-            if len(image.shape) == 2:
-                mask = resize(mask, image.shape[:2])
-            if len(image.shape) == 3:
-                mask = resize(mask, image.shape[1:3] + (2,))
-        elif model == "cellpose":
-            mask = cellpose_segment(image)
 
     mask_dict = dict()
     if compartment == "both":
@@ -938,6 +1291,8 @@ def segment_roi(
     if save:
         for comp, mask in mask_dict.items():
             mask_file = roi.get_input_filename(comp + "_mask")
+            if output_mask_suffix:
+                mask_file = mask_file.replace_(".tiff", output_mask_suffix + ".tiff")
             if overwrite or (not overwrite and not mask_file.exists()):
                 tifffile.imwrite(mask_file, mask)
 
@@ -946,7 +1301,7 @@ def segment_roi(
         if save:
             fig_file = roi.get_input_filename("stack").replace_(
                 ".tiff",
-                f"_segmentation_{model}_{compartment}.svg",
+                f"_segmentation_{model}_{compartment}{output_mask_suffix}.svg",
             )
             if overwrite or (not overwrite and not fig_file.exists()):
                 fig.savefig(fig_file, dpi=300, bbox_inches="tight")
