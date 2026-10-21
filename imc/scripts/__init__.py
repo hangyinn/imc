@@ -640,7 +640,8 @@ cli_config = {
                     "dest": "membrane_channels",
                     "default": "",
                     "help": "Comma-delimited list of markers combined into the membrane image "
-                    "when segmenting from the stack (not from probabilities), e.g. 'CD45,CD3,CD20'. "
+                    "when segmenting from the stack, or from probabilities with "
+                    "'--membrane-source markers', e.g. 'CD45,CD3,CD20'. "
                     "Default is all antibody channels except nuclear ones, Ki67 and SMA.",
                 },
             },
