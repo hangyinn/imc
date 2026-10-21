@@ -19,7 +19,7 @@ import sklearn
 from imc.types import Array, Figure, Path, Series
 from imc.data_models import roi as _roi
 from imc.graphics import random_label_cmap
-from imc.utils import minmax_scale
+from imc.utils import minmax_scale, read_image_from_file
 
 
 def normalize(image: Array, mode: str = "cyx") -> Array:
@@ -807,10 +807,12 @@ def deepcell_segment_probabilities(
     image_mpp: float = 1.0,
     postprocess_kwargs_whole_cell: tp.Dict[str, tp.Any] = None,
     postprocess_kwargs_nuclear: tp.Dict[str, tp.Any] = None,
-) -> Array:
+    return_maps: bool = False,
+) -> tp.Union[Array, tp.Tuple[Array, Array]]:
     """
     Segment ilastik probabilities (YXC: nuclear, cytoplasm, background) with the
-    DeepCell MultiplexSegmentation (Mesmer) model.
+    DeepCell MultiplexSegmentation (Mesmer) model. The first two channels are
+    Mesmer's nuclear and membrane images; the last channel is not used.
 
     Parameters
     ----------
@@ -824,6 +826,9 @@ def deepcell_segment_probabilities(
     postprocess_kwargs_whole_cell, postprocess_kwargs_nuclear: dict
         Post-processing settings passed to Mesmer, for example from
         ``mesmer_postprocess_kwargs``.
+    return_maps: bool
+        Whether to also return Mesmer's per-pixel outputs (compartment ``both``), an
+        array of shape (4, Y, X) with the layers in ``MESMER_MAPS``.
     """
     from deepcell.applications import MultiplexSegmentation
 
@@ -835,18 +840,18 @@ def deepcell_segment_probabilities(
         "both": "both",
     }
 
-    kwargs = dict()
+    kwargs: tp.Dict[str, tp.Any] = dict(compartment=imc2dc[compartment])
     if postprocess_kwargs_whole_cell:
         kwargs["postprocess_kwargs_whole_cell"] = dict(postprocess_kwargs_whole_cell)
     if postprocess_kwargs_nuclear:
         kwargs["postprocess_kwargs_nuclear"] = dict(postprocess_kwargs_nuclear)
     app = _deepcell_application(MultiplexSegmentation)
-    pred: Array = app.predict(
-        probabilities[np.newaxis, ..., :-1],
-        image_mpp=image_mpp,
-        compartment=imc2dc[compartment],
-        **kwargs,
-    )
+    image = probabilities[np.newaxis, ..., :-1]
+    if return_maps:
+        if compartment != "both":
+            raise ValueError("Maps are only returned for compartment 'both'.")
+        return _predict_with_maps(app, image, image_mpp, kwargs)
+    pred: Array = app.predict(image, image_mpp=image_mpp, **kwargs)
     return pred.squeeze()
 
 
@@ -1132,6 +1137,248 @@ def _keep_largest_piece(labels: Array) -> Array:
     return out
 
 
+def _border_signal(labels: Array, image: Array, groups: Array = None) -> pd.DataFrame:
+    """
+    Mean of ``image`` along the borders between touching labels (4-connected pixels).
+
+    Returns one row per pair of touching labels ``a`` < ``b`` with the mean signal of
+    the pixel pairs on their shared border (``mean``) and the number of pixel pairs
+    (``size``). If ``groups`` is given (e.g. a nuclear mask), only pixel pairs lying in
+    the same group are counted, and the group is given in the column ``group``.
+    """
+    rows = list()
+    for sa, sb in [
+        ((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+        ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+    ]:
+        a, b = labels[sa], labels[sb]
+        sel = (a > 0) & (b > 0) & (a != b)
+        if groups is not None:
+            ga, gb = groups[sa], groups[sb]
+            sel &= (ga > 0) & (ga == gb)
+        df = pd.DataFrame(
+            {
+                "a": np.minimum(a[sel], b[sel]),
+                "b": np.maximum(a[sel], b[sel]),
+                "signal": (image[sa][sel] + image[sb][sel]) / 2,
+            }
+        )
+        if groups is not None:
+            df["group"] = ga[sel]
+        rows.append(df)
+    keys = ["a", "b"] + (["group"] if groups is not None else [])
+    return pd.concat(rows).groupby(keys)["signal"].agg(["mean", "size"]).reset_index()
+
+
+def _union_pairs(
+    pairs: tp.Iterable[tp.Tuple[int, int]],
+    n_labels: int,
+    area: Array = None,
+    max_area: float = np.inf,
+) -> tp.Tuple[Array, int]:
+    """
+    Join label pairs in the order given (union-find), skipping a pair if the joined
+    object would be larger than ``max_area`` (``area`` gives the size of each label).
+
+    Returns the new label of each label (the label of its largest member) and the
+    number of joins.
+    """
+    parent = np.arange(n_labels)
+    size = np.zeros(n_labels) if area is None else np.asarray(area, dtype=float).copy()
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    n = 0
+    for a, b in pairs:
+        ra, rb = find(a), find(b)
+        if ra == rb or size[ra] + size[rb] > max_area:
+            continue
+        keep, drop = (ra, rb) if size[ra] >= size[rb] else (rb, ra)
+        parent[drop] = keep
+        size[keep] += size[drop]
+        n += 1
+    return np.asarray([find(x) for x in range(n_labels)]), n
+
+
+def _merge_split_nuclei(
+    nuc: Array,
+    dna: Array,
+    median_area: float,
+    border_ratio: float = 0.9,
+    max_union_area: float = 2.5,
+    min_solidity: float = 0.9,
+    min_contact: int = 3,
+    max_passes: int = 5,
+    same_cell: Array = None,
+) -> tp.Tuple[Array, int]:
+    """
+    Find touching nuclei that are pieces of one nucleus: the smoothed DNA signal along
+    their shared border (at least ``min_contact`` pixel pairs) is at least
+    ``border_ratio`` times the mean signal of the brighter piece (no dip between them),
+    and together they form a convex object (solidity of at least ``min_solidity``) no
+    larger than ``max_union_area`` times ``median_area``. Pairs are joined in order of
+    decreasing border signal, each piece at most once per pass; passes are repeated
+    (up to ``max_passes``) so that a nucleus cut into three or more pieces is rejoined.
+
+    If ``same_cell`` is given (the cell of each label of ``nuc``), only nuclei of the
+    same cell are joined.
+
+    Returns the new label of each label of ``nuc`` and the number of joins.
+    """
+    from skimage.morphology import convex_hull_image
+
+    target = np.arange(nuc.max() + 1)
+    n_merged = 0
+    current = nuc.copy()
+    for _ in range(max(1, max_passes) if nuc.max() > 0 else 0):
+        ids = np.unique(current)
+        ids = ids[ids > 0]
+        mean_dna = np.zeros(current.max() + 1)
+        mean_dna[ids] = ndi.mean(dna, labels=current, index=ids)
+        area = np.bincount(current.ravel(), minlength=current.max() + 1)
+        pairs = _border_signal(current, dna)
+        if pairs.empty:
+            break
+        a, b = pairs["a"].values, pairs["b"].values
+        pairs["ratio"] = pairs["mean"].values / np.maximum(mean_dna[a], mean_dna[b])
+        sel = (
+            (pairs["size"] >= min_contact)
+            & (pairs["ratio"] >= border_ratio)
+            & (area[a] + area[b] <= max_union_area * median_area)
+        )
+        if same_cell is not None:
+            sel &= (same_cell[a] == same_cell[b]) & (same_cell[a] > 0)
+        pairs = pairs[sel].sort_values("ratio", ascending=False)
+        objs = ndi.find_objects(current)
+        step = np.arange(current.max() + 1)
+        used: tp.Set[int] = set()
+        for a, b in zip(pairs["a"].values, pairs["b"].values):
+            if (a in used) or (b in used):
+                continue
+            sl = tuple(
+                slice(min(p.start, q.start), max(p.stop, q.stop))
+                for p, q in zip(objs[a - 1], objs[b - 1])
+            )
+            union = np.isin(current[sl], [a, b])
+            if union.sum() / convex_hull_image(union).sum() < min_solidity:
+                continue
+            keep, drop = (a, b) if area[a] >= area[b] else (b, a)
+            step[drop] = keep
+            used.update([a, b])
+        if not used:
+            break
+        n_merged += len(used) // 2
+        target = step[target]
+        current = step[current]
+    return target, n_merged
+
+
+def _merge_cells_across_nuclei(
+    cell: Array,
+    nuc: Array,
+    dna: Array,
+    dominant_nuclei_threshold: float = 0.8,
+    border_ratio: float = 0.9,
+    max_nucleus_area: float = 2.5,
+    min_contact: int = 3,
+) -> tp.Tuple[Array, int]:
+    """
+    Merge cells whose border runs through one nucleus without a dip in the DNA signal.
+
+    A nucleus shared by several cells, none holding more than
+    ``dominant_nuclei_threshold`` of it, and no larger than ``max_nucleus_area`` times
+    the median nucleus, is taken to be one nucleus if the smoothed DNA signal along the
+    cell border inside it (at least ``min_contact`` pixel pairs) is at least
+    ``border_ratio`` times the mean signal of the nucleus. The cells on both sides of
+    such a border are merged.
+
+    Returns the cell mask and the number of merges.
+    """
+    if (nuc.max() == 0) or (cell.max() == 0):
+        return cell, 0
+    ov = _label_overlaps(nuc, cell).rename(columns={"a": "nucleus", "b": "cell"})
+    ov["share"] = ov["n"] / ov.groupby("nucleus")["n"].transform("sum")
+    top = ov.groupby("nucleus")["share"].max()
+    area = np.bincount(nuc.ravel(), minlength=nuc.max() + 1)
+    ids = np.unique(nuc)
+    ids = ids[ids > 0]
+    median_area = np.median(area[ids])
+    shared = top.index[top <= dominant_nuclei_threshold].values
+    shared = shared[area[shared] <= max_nucleus_area * median_area]
+    if len(shared) == 0:
+        return cell, 0
+    groups = np.where(np.isin(nuc, shared), nuc, 0)
+    pairs = _border_signal(cell, dna, groups=groups)
+    if pairs.empty:
+        return cell, 0
+    mean_dna = np.zeros(nuc.max() + 1)
+    mean_dna[shared] = ndi.mean(dna, labels=nuc, index=shared)
+    pairs["ratio"] = pairs["mean"].values / mean_dna[pairs["group"].values]
+    pairs = pairs[(pairs["size"] >= min_contact) & (pairs["ratio"] >= border_ratio)]
+    pairs = pairs.sort_values("ratio", ascending=False)
+    cell_area = np.bincount(cell.ravel(), minlength=cell.max() + 1)
+    target, n = _union_pairs(
+        zip(pairs["a"].values, pairs["b"].values), cell.max() + 1, area=cell_area
+    )
+    return target[cell], n
+
+
+def _merge_cells_in_marker(
+    cell: Array,
+    marker_image: Array,
+    quantile: float = 0.95,
+    border_ratio: float = 0.9,
+    max_area: float = np.inf,
+    min_contact: int = 3,
+) -> tp.Tuple[Array, int]:
+    """
+    Merge neighbouring cells that lie in one continuous area of a marker's signal, for
+    example a CD68+ macrophage cut into several cells.
+
+    Both cells must have a mean (smoothed) marker signal of at least the ``quantile``
+    of all cells, and the signal along their shared border (at least ``min_contact``
+    pixel pairs) must be at least ``border_ratio`` times the mean signal of the dimmer
+    cell. Cells are joined in order of decreasing border signal while the joined cell
+    is no larger than ``max_area`` pixels.
+
+    Returns the new label of each cell label and the number of merges.
+    """
+    target = np.arange(cell.max() + 1)
+    if cell.max() < 2:
+        return target, 0
+    signal = ndi.gaussian_filter(np.asarray(marker_image, dtype=float), 1.0)
+    ids = np.unique(cell)
+    ids = ids[ids > 0]
+    mean = np.zeros(cell.max() + 1)
+    mean[ids] = ndi.mean(signal, labels=cell, index=ids)
+    high = np.zeros(cell.max() + 1, dtype=bool)
+    high[ids] = mean[ids] >= np.quantile(mean[ids], quantile)
+    pairs = _border_signal(cell, signal)
+    if pairs.empty:
+        return target, 0
+    a, b = pairs["a"].values, pairs["b"].values
+    pairs["ratio"] = pairs["mean"].values / np.maximum(
+        np.minimum(mean[a], mean[b]), 1e-12
+    )
+    pairs = pairs[
+        high[a]
+        & high[b]
+        & (pairs["size"] >= min_contact)
+        & (pairs["ratio"] >= border_ratio)
+    ].sort_values("ratio", ascending=False)
+    area = np.bincount(cell.ravel(), minlength=cell.max() + 1)
+    return _union_pairs(
+        zip(pairs["a"].values, pairs["b"].values),
+        cell.max() + 1,
+        area=area,
+        max_area=max_area,
+    )
+
+
 def align_cell_and_nuclear_masks(
     mask: Array,
     dominant_nuclei_threshold: float = 0.8,
@@ -1140,21 +1387,34 @@ def align_cell_and_nuclear_masks(
     nuclear_image: Array = None,
     fill_gaps: bool = False,
     verbose: bool = False,
+    dna: Array = None,
+    keep_nuclei_whole: bool = True,
+    border_ratio: float = 0.9,
+    max_nucleus_area: float = 2.5,
+    min_solidity: float = 0.9,
+    min_contact: int = 3,
 ) -> Array:
     """
     Pair the cell and nuclear masks of the DeepCell MultiplexSegmentation model
     ('both' compartment) one to one without discarding objects.
 
     Rules, in order:
+        0. If ``keep_nuclei_whole`` and a ``dna`` image is given, cells whose border
+           runs through one nucleus without a dip in the DNA signal are merged, so
+           that the nucleus is not divided in rule 1 (see
+           ``_merge_cells_across_nuclei``).
         1. A nucleus overlapping several cells is given whole to the cell holding
            more than ``dominant_nuclei_threshold`` of it; otherwise it is divided
            along the cell borders. Cells are extended to contain their nucleus.
         2. A nucleus outside all cells becomes a cell: the nucleus expanded by
            ``nucleus_expansion`` pixels into unassigned pixels.
-        3. Nuclei within one cell are merged into the largest one if it holds more
-           than ``dominant_nuclei_threshold`` of their area. Otherwise the cell is
-           divided between its nuclei by seeded watershed. Nuclear fragments smaller
-           than ``min_nucleus_area`` pixels in such cells are dropped.
+        3. If ``keep_nuclei_whole`` and a ``dna`` image is given, touching nuclei of
+           one cell without a DNA dip between them are first joined (see
+           ``_merge_split_nuclei``). Nuclei within one cell are merged into the
+           largest one if it holds more than ``dominant_nuclei_threshold`` of their
+           area. Otherwise the cell is divided between its nuclei by seeded
+           watershed. Nuclear fragments smaller than ``min_nucleus_area`` pixels in
+           such cells are dropped.
         4. Cells without a nucleus are kept, with no nucleus (0 in the nuclear mask).
         5. If ``fill_gaps``, nuclei found in ``nuclear_image`` (DNA) in pixels not
            covered by any cell are added as cells, expanded as in rule 2.
@@ -1167,6 +1427,20 @@ def align_cell_and_nuclear_masks(
         Array of shape (Y, X, 2) with the cell and nuclear masks.
     nuclear_image: Array
         DNA image of shape (Y, X); only used if ``fill_gaps``.
+    dna: Array
+        DNA image of shape (Y, X), without clipping (e.g. ``dna_image``), used to
+        test for a dip between parts of a nucleus (rules 0 and 3).
+    keep_nuclei_whole: bool
+        Whether to apply rules 0 and 3 when ``dna`` is given.
+    border_ratio, min_contact: float, int
+        A border shows no dip when the DNA signal along it, over at least
+        ``min_contact`` pixel pairs, is at least ``border_ratio`` times the mean
+        signal of the nucleus (rule 0) or of the brighter of two nuclei (rule 3).
+    max_nucleus_area: float
+        Largest nucleus kept whole by rules 0 and 3, as a multiple of the median
+        nucleus.
+    min_solidity: float
+        Smallest solidity of two nuclei joined in rule 3.
 
     Returns
     -------
@@ -1180,6 +1454,26 @@ def align_cell_and_nuclear_masks(
     cell = relabel_sequential(mask[..., 0].astype(np.int64))[0]
     nuc = relabel_sequential(mask[..., 1].astype(np.int64))[0]
     stats = {"cells_in": int(cell.max()), "nuclei_in": int(nuc.max())}
+    whole = keep_nuclei_whole and (dna is not None)
+    if whole:
+        if dna.shape != cell.shape:
+            raise ValueError("The DNA image must have the shape of the masks.")
+        dna = ndi.gaussian_filter(np.asarray(dna, dtype=float), 1.0)
+        nuc_area = np.bincount(nuc.ravel())[1:]
+        median_nucleus = np.median(nuc_area[nuc_area > 0]) if nuc.max() > 0 else 0.0
+
+    # 0. Cells cut through one nucleus without a DNA dip
+    if whole:
+        cell, n = _merge_cells_across_nuclei(
+            cell,
+            nuc,
+            dna,
+            dominant_nuclei_threshold=dominant_nuclei_threshold,
+            border_ratio=border_ratio,
+            max_nucleus_area=max_nucleus_area,
+            min_contact=min_contact,
+        )
+        stats["cells_merged_across_nuclei"] = n
 
     # 1. Nuclei overlapping several cells
     ov = _label_overlaps(nuc, cell).rename(columns={"a": "nucleus", "b": "cell"})
@@ -1219,6 +1513,23 @@ def align_cell_and_nuclear_masks(
     nuc[cell == 0] = 0
 
     # 3. Cells with several nuclei
+    if whole and nuc.max() > 0:
+        ov = _label_overlaps(cell, nuc).rename(columns={"a": "cell", "b": "nucleus"})
+        ov = ov.sort_values("n", ascending=False).drop_duplicates("nucleus")
+        cell_of = np.zeros(nuc.max() + 1, dtype=np.int64)
+        cell_of[ov["nucleus"].values] = ov["cell"].values
+        joined, n = _merge_split_nuclei(
+            nuc,
+            dna,
+            median_nucleus,
+            border_ratio=border_ratio,
+            max_union_area=max_nucleus_area,
+            min_solidity=min_solidity,
+            min_contact=min_contact,
+            same_cell=cell_of,
+        )
+        nuc = joined[nuc]
+        stats["nuclei_joined_in_cells"] = n
     ov = _label_overlaps(cell, nuc).rename(columns={"a": "cell", "b": "nucleus"})
     ov = ov.sort_values("n", ascending=False).drop_duplicates("nucleus")
     ov["area"] = np.bincount(nuc.ravel())[ov["nucleus"].values]
@@ -1338,6 +1649,18 @@ def dna_image(roi: _roi.ROI) -> Array:
     return np.asarray(stack[nuclear_channels(labels)], dtype=float).mean(0)
 
 
+def marker_image(roi: _roi.ROI, marker: str) -> Array:
+    """Signal of one marker of an ROI, e.g. 'CD68', without normalization."""
+    stack, labels = roi.stack, roi.channel_labels
+    if roi.channel_exclude is not None:
+        keep = ~np.asarray(roi.channel_exclude, dtype=bool)
+        stack, labels = stack[keep], labels[keep]
+    sel = (marker_names(labels) == marker).values
+    if sel.sum() == 0:
+        raise ValueError(f"Marker '{marker}' was not found in the stack.")
+    return np.asarray(stack[sel], dtype=float).mean(0)
+
+
 def marker_signal_image(roi: _roi.ROI) -> Array:
     """Sum of the antibody channels of an ROI other than DNA, without normalization."""
     stack, labels = roi.stack, roi.channel_labels
@@ -1356,29 +1679,43 @@ def qc_cell_and_nuclear_masks(
     partial_nucleus_area: float = 15,
     merge_split_nuclei: bool = True,
     border_ratio: float = 0.9,
-    max_union_area: float = 1.5,
+    max_union_area: float = 2.5,
     min_solidity: float = 0.9,
     min_contact: int = 3,
     signal_image: Array = None,
     empty_quantile: float = 0.01,
     verbose: bool = False,
+    max_merge_passes: int = 5,
+    merge_marker_image: Array = None,
+    marker_quantile: float = 0.95,
+    marker_border_ratio: float = 0.9,
+    max_marker_cell_area: float = np.inf,
 ) -> tp.Tuple[Array, pd.DataFrame]:
     """
     Quality control of paired cell and nuclear masks, as returned by
     ``align_cell_and_nuclear_masks`` (each nucleus carries the label of its cell).
 
     Rules, in order:
-        1. A nucleus split in two is made whole again: two touching nuclei, with their
-           cells, are merged when the DNA signal along their shared border (at least
-           ``min_contact`` pixels) is at least ``border_ratio`` times the mean DNA
+        1. A nucleus split into pieces is made whole again: two touching nuclei, with
+           their cells, are merged when the DNA signal along their shared border (at
+           least ``min_contact`` pixels) is at least ``border_ratio`` times the mean DNA
            signal of the brighter nucleus (no dip between them), and together they form
            a convex object (solidity of at least ``min_solidity``) no larger than
-           ``max_union_area`` times the median nucleus.
-        2. Cells smaller than ``min_cell_area`` pixels are removed.
-        3. If ``signal_image`` is given, cells without a nucleus whose mean marker signal
+           ``max_union_area`` times the median nucleus. This is repeated up to
+           ``max_merge_passes`` times, so that a nucleus cut into three or more pieces
+           is rejoined. ``max_union_area=1.5`` and ``max_merge_passes=1`` give the
+           behaviour of earlier versions.
+        2. If ``merge_marker_image`` is given (e.g. CD68), neighbouring cells that lie
+           in one continuous area of its signal are merged, for example a macrophage
+           cut into several cells (see ``_merge_cells_in_marker``; both cells above the
+           ``marker_quantile`` of cells, border signal at least ``marker_border_ratio``
+           times that of the dimmer cell, merged cells up to ``max_marker_cell_area``
+           pixels).
+        3. Cells smaller than ``min_cell_area`` pixels are removed.
+        4. If ``signal_image`` is given, cells without a nucleus whose mean marker signal
            is below the ``empty_quantile`` of that of cells with a nucleus are removed
            (objects drawn over empty or nearly empty areas).
-        4. Nuclei are kept whatever their size. Nuclei smaller than
+        5. Nuclei are kept whatever their size. Nuclei smaller than
            ``partial_nucleus_area`` pixels are flagged as partial, for example a nucleus
            cut near its top or bottom by the section.
 
@@ -1390,6 +1727,8 @@ def qc_cell_and_nuclear_masks(
         DNA image of shape (Y, X), without clipping (e.g. ``dna_image``).
     signal_image: Array
         Marker signal of shape (Y, X), e.g. ``marker_signal_image``.
+    merge_marker_image: Array
+        Signal of one marker of shape (Y, X), used by rule 2.
 
     Returns
     -------
@@ -1397,7 +1736,6 @@ def qc_cell_and_nuclear_masks(
     ``area`` and ``nucleus_area`` (pixels), ``has_nucleus``, ``partial_nucleus`` and
     ``merged_pieces`` (number of segmented cells merged into this one).
     """
-    from skimage.morphology import convex_hull_image
     from skimage.segmentation import relabel_sequential
 
     if (mask.ndim != 3) or (mask.shape[-1] != 2):
@@ -1407,65 +1745,48 @@ def qc_cell_and_nuclear_masks(
     target = np.arange(cell.max() + 1)
     n_merged = 0
 
-    # 1. Nuclei split in two
+    # 1. Nuclei split into pieces
     if merge_split_nuclei and nuc.max() > 0:
         dna = ndi.gaussian_filter(np.asarray(nuclear_image, dtype=float), 1.0)
-        ids = np.unique(nuc)
-        ids = ids[ids > 0]
-        mean_dna = np.zeros(nuc.max() + 1)
-        mean_dna[ids] = ndi.mean(dna, labels=nuc, index=ids)
-        area = np.bincount(nuc.ravel(), minlength=nuc.max() + 1)
-        median_area = np.median(area[ids])
-        border = list()
-        for a, b, dy, dx in [(nuc[:, :-1], nuc[:, 1:], 0, 1), (nuc[:-1, :], nuc[1:, :], 1, 0)]:
-            sel = (a > 0) & (b > 0) & (a != b)
-            y, x = np.nonzero(sel)
-            border.append(
-                pd.DataFrame(
-                    {
-                        "a": np.minimum(a[sel], b[sel]),
-                        "b": np.maximum(a[sel], b[sel]),
-                        "dna": (dna[y, x] + dna[y + dy, x + dx]) / 2,
-                    }
-                )
-            )
-        pairs = pd.concat(border).groupby(["a", "b"])["dna"].agg(["mean", "size"])
-        pairs = pairs.reset_index()
-        a, b = pairs["a"].values, pairs["b"].values
-        pairs["ratio"] = pairs["mean"].values / np.maximum(mean_dna[a], mean_dna[b])
-        pairs = pairs[
-            (pairs["size"] >= min_contact)
-            & (pairs["ratio"] >= border_ratio)
-            & (area[a] + area[b] <= max_union_area * median_area)
-        ].sort_values("ratio", ascending=False)
-        objs = ndi.find_objects(nuc)
-        used = set()
-        for a, b in zip(pairs["a"].values, pairs["b"].values):
-            if (a in used) or (b in used):
-                continue
-            sl = tuple(
-                slice(min(p.start, q.start), max(p.stop, q.stop))
-                for p, q in zip(objs[a - 1], objs[b - 1])
-            )
-            union = np.isin(nuc[sl], [a, b])
-            if union.sum() / convex_hull_image(union).sum() < min_solidity:
-                continue
-            keep, drop = (a, b) if area[a] >= area[b] else (b, a)
-            target[drop] = keep
-            used.update([a, b])
-            n_merged += 1
+        area = np.bincount(nuc.ravel())[1:]
+        joined, n_merged = _merge_split_nuclei(
+            nuc,
+            dna,
+            np.median(area[area > 0]),
+            border_ratio=border_ratio,
+            max_union_area=max_union_area,
+            min_solidity=min_solidity,
+            min_contact=min_contact,
+            max_passes=max_merge_passes,
+        )
+        target[: len(joined)] = joined
         cell = target[cell]
         nuc = target[nuc]
+
+    # 2. One cell cut into several within continuous marker signal
+    n_marker = 0
+    if merge_marker_image is not None and cell.max() > 0:
+        joined, n_marker = _merge_cells_in_marker(
+            cell,
+            merge_marker_image,
+            quantile=marker_quantile,
+            border_ratio=marker_border_ratio,
+            max_area=max_marker_cell_area,
+            min_contact=min_contact,
+        )
+        target = joined[target]
+        cell = joined[cell]
+        nuc = joined[nuc]
     pieces = np.bincount(target, minlength=len(target))
 
-    # 2. Small cells
+    # 3. Small cells
     cell_area = np.bincount(cell.ravel(), minlength=cell.max() + 1)
     small = (cell_area > 0) & (cell_area < min_cell_area)
     small[0] = False
     cell[small[cell]] = 0
     nuc[cell == 0] = 0
 
-    # 3. Cells without a nucleus over empty areas
+    # 4. Cells without a nucleus over empty areas
     n_empty = 0
     if signal_image is not None and cell.max() > 0:
         ids = np.unique(cell)
@@ -1498,7 +1819,8 @@ def qc_cell_and_nuclear_masks(
     )
     if verbose:
         print(
-            f"Cell QC: {n_merged} nuclei split in two were merged, {int(small.sum())} cells "
+            f"Cell QC: {n_merged} joins of split nuclei, {n_marker} joins of cells within "
+            f"continuous marker signal; {int(small.sum())} cells "
             f"under {min_cell_area:g} px and {n_empty} empty cells without nucleus removed; "
             f"{int((~table['has_nucleus']).sum())} cells without nucleus, "
             f"{int(table['partial_nucleus'].sum())} with a partial nucleus."
@@ -1530,6 +1852,11 @@ def segment_roi(
     partial_nucleus_area: float = 15.0,
     save_maps: bool = False,
     output_dir: Path = None,
+    membrane_source: str = "ilastik",
+    ilastik_dir: Path = None,
+    keep_nuclei_whole: bool = True,
+    merge_marker: str = None,
+    max_marker_cell_area: float = 300.0,
 ) -> tp.Dict[str, tp.Any]:
     """
     Segment the area of an ROI.
@@ -1556,8 +1883,8 @@ def segment_roi(
     image_mpp: float
         Pixel size of the stack in micrometres (1.0 for IMC), passed to DeepCell.
     membrane_channels: list[str]
-        Markers combined into the membrane image when segmenting from the stack.
-        See ``prepare_stack``.
+        Markers combined into the membrane image when segmenting from the stack, or
+        from probabilities with ``membrane_source`` ``markers``. See ``prepare_stack``.
     postprocessing_mode: str
         ``align`` (``align_cell_and_nuclear_masks``) or ``legacy``
         (``deepcell_postprocess_both_compartments``).
@@ -1589,9 +1916,29 @@ def segment_roi(
         Nuclei smaller than this (um2) are flagged as partial in the QC table.
     save_maps: bool
         Whether to save Mesmer's per-pixel outputs (``MESMER_MAPS``) and its input
-        images (``model`` deepcell, ``compartment`` both, from the stack).
+        images (``model`` deepcell, ``compartment`` both).
     output_dir: Path
         Directory for the outputs. By default they are written next to the stack.
+    membrane_source: str
+        Membrane image given to Mesmer when segmenting from probabilities: ``ilastik``
+        (the cytoplasm probability) or ``markers`` (the marker channels, made as when
+        segmenting from the stack; see ``membrane_channels`` and ``membrane_mode``).
+        The nuclear image is the nucleus probability in both cases.
+    ilastik_dir: Path
+        Directory with the ilastik probabilities ('<roi>_Probabilities.tiff'). By
+        default they are read next to the stack.
+    keep_nuclei_whole: bool
+        Whether to avoid dividing nuclei that show no dip in the DNA signal: cells
+        whose border runs through such a nucleus are merged, touching nuclei of one
+        cell are joined before the cell is divided (``align_cell_and_nuclear_masks``),
+        and nuclei split into pieces are rejoined up to 2.5 times the median nucleus,
+        repeatedly (``qc_cell_and_nuclear_masks``). ``False`` gives the behaviour of
+        earlier versions (pieces rejoined once, up to 1.5 times the median nucleus).
+    merge_marker: str
+        Marker, e.g. 'CD68', whose continuous signal joins neighbouring cells in the QC
+        step (one macrophage cut into several cells). Off by default.
+    max_marker_cell_area: float
+        Largest cell (um2) made by joining cells with ``merge_marker``.
 
     Returns
     -------
@@ -1599,23 +1946,47 @@ def segment_roi(
     (``cell_qc``) and Mesmer's per-pixel outputs (``mesmer_maps``).
     """
     assert postprocessing_mode in ["align", "legacy"]
+    assert membrane_source in ["ilastik", "markers"]
     kw_cell, kw_nuc = mesmer_postprocess_kwargs(
         whole_cell_threshold, min_cell_area, min_nucleus_area, cell_expansion
     )
     maps = None
     if from_probabilities:
         assert model in ["deepcell"]
-        image = roi.probabilities
+        if ilastik_dir is not None:
+            image = read_image_from_file(
+                Path(ilastik_dir) / (roi.name + "_Probabilities.tiff")
+            )
+        else:
+            image = roi.probabilities
         # probabilities are predicted on a 2x upscaled image: return to the stack grid
         shape = tuple([int(x / 2) for x in image.shape[1:]])
         image = resize(image / image.max(), (3,) + shape)
+        if membrane_source == "markers":
+            membrane = prepare_stack(
+                roi.stack,
+                roi.channel_labels,
+                "cytoplasm",
+                roi.channel_exclude,
+                membrane_channels=membrane_channels,
+                normalization="percentile",
+                membrane_mode=membrane_mode,
+            )
+            if membrane.shape != shape:
+                membrane = resize(membrane, shape)
+            image[1] = membrane
         mask = deepcell_segment_probabilities(
             np.moveaxis(image, 0, -1),
             compartment,
             image_mpp=image_mpp,
             postprocess_kwargs_whole_cell=kw_cell,
             postprocess_kwargs_nuclear=kw_nuc,
+            return_maps=save_maps and compartment == "both",
         )
+        if isinstance(mask, tuple):
+            mask, maps = mask
+        # the nuclear and membrane images given to Mesmer
+        image = image[:2]
     else:
         assert model in ["deepcell", "stardist", "cellpose"]
         image = prepare_stack(
@@ -1667,18 +2038,32 @@ def segment_roi(
                     roi.channel_exclude,
                     normalization="percentile",
                 )
+            raw_dna = dna_image(roi)
+            if raw_dna.shape != mask.shape[:2]:
+                raw_dna = resize(raw_dna, mask.shape[:2])
             mask = align_cell_and_nuclear_masks(
-                mask, nuclear_image=dna, fill_gaps=fill_gaps, verbose=verbose
+                mask,
+                nuclear_image=dna,
+                fill_gaps=fill_gaps,
+                verbose=verbose,
+                dna=raw_dna if keep_nuclei_whole else None,
+                keep_nuclei_whole=keep_nuclei_whole,
             )
             if qc:
                 px = image_mpp**2
                 mask, cell_qc = qc_cell_and_nuclear_masks(
                     mask,
-                    dna_image(roi),
+                    raw_dna,
                     min_cell_area=(min_cell_area or 0) / px,
                     partial_nucleus_area=(partial_nucleus_area or 0) / px,
                     signal_image=marker_signal_image(roi),
                     verbose=verbose,
+                    max_union_area=2.5 if keep_nuclei_whole else 1.5,
+                    max_merge_passes=5 if keep_nuclei_whole else 1,
+                    merge_marker_image=(
+                        marker_image(roi, merge_marker) if merge_marker else None
+                    ),
+                    max_marker_cell_area=(max_marker_cell_area or np.inf) / px,
                 )
                 cell_qc.insert(2, "area_um2", cell_qc["area"] * px)
                 cell_qc.insert(4, "nucleus_area_um2", cell_qc["nucleus_area"] * px)
@@ -1723,7 +2108,7 @@ def segment_roi(
             )
 
     if plot_segmentation:
-        fig = plot_image_and_mask(image, mask_dict)
+        fig = plot_image_and_mask(image, dict(mask_dict))
         if save:
             fig_file = output_file(
                 roi.get_input_filename("stack"),

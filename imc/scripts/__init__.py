@@ -357,6 +357,16 @@ cli_config = {
                 },
             },
             {
+                "args": ["--ilastik-dir"],
+                "kwargs": {
+                    "dest": "ilastik_dir",
+                    "type": Path,
+                    "default": None,
+                    "help": "Directory for the ilastik input files made from TIFF stacks "
+                    "('<roi>_ilastik_s2.h5'). Default is next to each stack.",
+                },
+            },
+            {
                 "args": ["--only-crops"],
                 "kwargs": {
                     "dest": "only_crops",
@@ -504,6 +514,17 @@ cli_config = {
                     "action": "store_false",
                     "help": "Whether to not cleanup ilastik input files. "
                     "Default is to clean them.",
+                },
+            },
+            {
+                "args": ["--ilastik-dir"],
+                "kwargs": {
+                    "dest": "ilastik_dir",
+                    "type": Path,
+                    "default": None,
+                    "help": "Directory with the ilastik input files ('<roi>_ilastik_s2.h5') "
+                    "and for the probability files ('<roi>_Probabilities.tiff'). "
+                    "Default is next to each stack.",
                 },
             },
         ],
@@ -724,6 +745,62 @@ cli_config = {
                     "default": None,
                     "help": "Directory to write the masks and other outputs to. "
                     "Default is next to each input TIFF.",
+                },
+            },
+            {
+                "args": ["--membrane-source"],
+                "kwargs": {
+                    "dest": "membrane_source",
+                    "choices": ["ilastik", "markers"],
+                    "default": "ilastik",
+                    "help": "Membrane image given to DeepCell with '--from-probabilities': "
+                    "ilastik's cytoplasm probability ('ilastik', default) or the marker "
+                    "channels ('markers', see '--membrane-channels' and '--membrane-mode'). "
+                    "The nuclear image is ilastik's nucleus probability in both cases.",
+                },
+            },
+            {
+                "args": ["--ilastik-dir"],
+                "kwargs": {
+                    "dest": "ilastik_dir",
+                    "type": Path,
+                    "default": None,
+                    "help": "Directory with the ilastik probability files "
+                    "('<roi>_Probabilities.tiff') used with '--from-probabilities'. "
+                    "Default is next to each input TIFF.",
+                },
+            },
+            {
+                "args": ["--no-keep-nuclei-whole"],
+                "kwargs": {
+                    "dest": "keep_nuclei_whole",
+                    "action": "store_false",
+                    "help": "Whether to divide nuclei crossed by a cell border, and cells "
+                    "holding touching nuclei, even when the DNA signal shows no dip between "
+                    "the parts, and to rejoin split nuclei only once and up to 1.5 times "
+                    "the median nucleus (the behaviour of earlier versions). Default is to "
+                    "keep such nuclei whole by merging the cells.",
+                },
+            },
+            {
+                "args": ["--merge-marker"],
+                "kwargs": {
+                    "dest": "merge_marker",
+                    "type": str,
+                    "default": None,
+                    "help": "Marker (e.g. 'CD68') whose continuous signal joins neighbouring "
+                    "cells in the QC step, for a macrophage cut into several cells. "
+                    "Default is not to join cells by marker signal.",
+                },
+            },
+            {
+                "args": ["--max-marker-cell-area"],
+                "kwargs": {
+                    "dest": "max_marker_cell_area",
+                    "type": float,
+                    "default": 300.0,
+                    "help": "Largest cell (um2) made by joining cells with '--merge-marker'. "
+                    "Default is 300.",
                 },
             },
             {

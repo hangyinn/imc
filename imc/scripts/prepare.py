@@ -97,6 +97,8 @@ def main(cli: tp.Sequence[str] = None) -> int:
     for tiff in tiffs:
         roi = ROI.from_stack(tiff)
         ilastik_input = tiff.replace_("_full.tiff", "_ilastik_s2.h5")
+        if args.ilastik_dir is not None:
+            ilastik_input = args.ilastik_dir.mkdir() / ilastik_input.name
         if (not ilastik_input.exists()) or args.overwrite:
             print(f"Preparing TIFF file: '{tiff}'.")
             s = prepare_stack(roi.stack, roi.channel_labels)

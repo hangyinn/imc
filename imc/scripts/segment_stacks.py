@@ -83,6 +83,11 @@ def main(cli: tp.Sequence[str] = None) -> int:
                 partial_nucleus_area=args.partial_nucleus_area,
                 save_maps=args.save_maps,
                 output_dir=args.output_dir,
+                membrane_source=args.membrane_source,
+                ilastik_dir=args.ilastik_dir,
+                keep_nuclei_whole=args.keep_nuclei_whole,
+                merge_marker=args.merge_marker,
+                max_marker_cell_area=args.max_marker_cell_area,
             )
         except ValueError as e:
             print("Error segmenting stack. Perhaps XY shape is not compatible?")

@@ -30,7 +30,7 @@ def main(cli: tp.Sequence[str] = None) -> int:
     rois = list()
     for tiff in args.tiffs:
         roi = ROI.from_stack(tiff)
-        out = roi.get_input_filename("probabilities")
+        out = ilastik_file(roi, "probabilities", args.ilastik_dir)
         if not args.overwrite and out.exists():
             continue
         rois.append(roi)
@@ -48,20 +48,27 @@ def main(cli: tp.Sequence[str] = None) -> int:
 
     # Predict
     print("Starting ilastik pixel classification.")
-    tiff_files = [roi.get_input_filename("ilastik_input") for roi in rois]
+    tiff_files = [ilastik_file(roi, "ilastik_input", args.ilastik_dir) for roi in rois]
     predict_with_ilastik(tiff_files, ilastik_sh, model_ilp, args.quiet)
 
-    for roi in rois:
-        _in = roi.root_dir / roi.name + "_ilastik_s2_Probabilities.tiff"
+    for roi, h5 in zip(rois, tiff_files):
+        # ilastik writes its output next to its input
+        _in = h5.replace_("_ilastik_s2.h5", "_ilastik_s2_Probabilities.tiff")
         if _in.exists():
-            _in.rename(roi.get_input_filename("probabilities"))
+            _in.rename(ilastik_file(roi, "probabilities", args.ilastik_dir))
 
     if args.cleanup:
-        for roi in rois:
-            roi.get_input_filename("ilastik_input").unlink()
+        for h5 in tiff_files:
+            h5.unlink()
 
     print("Finished predict step!")
     return 0
+
+
+def ilastik_file(roi: ROI, kind: str, ilastik_dir: Path = None) -> Path:
+    """Path of the ilastik input ('ilastik_input') or output ('probabilities') of an ROI."""
+    file = roi.get_input_filename(kind)
+    return file if ilastik_dir is None else Path(ilastik_dir) / file.name
 
 
 def predict_with_ilastik(
