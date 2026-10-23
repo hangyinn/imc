@@ -367,6 +367,22 @@ def test_segment_cli_options(monkeypatch):
     assert args.from_probabilities and args.membrane_source == "markers"
     assert args.ilastik_dir.name == "probabilities"
     assert not args.keep_nuclei_whole and args.merge_marker == "CD68"
+    assert args.mesmer_mpp is None and args.qc_min_cell_area is None
+    assert args.nuclear_markers == "" and not args.join_pieces_without_peak
+    args = build_cli("segment").parse_args(
+        [
+            "--mesmer-mpp",
+            "0.7",
+            "--qc-min-cell-area",
+            "25",
+            "--nuclear-markers",
+            "DNA1,DNA2,HH3",
+            "--join-pieces-without-peak",
+            "a_full.tiff",
+        ]
+    )
+    assert args.mesmer_mpp == 0.7 and args.qc_min_cell_area == 25.0
+    assert args.nuclear_markers == "DNA1,DNA2,HH3" and args.join_pieces_without_peak
 
 
 def test_membrane_image_max_mode():
@@ -863,3 +879,78 @@ def test_cells_within_continuous_marker_signal_are_merged():
         max_marker_cell_area=500,
     )
     assert out[..., 0].max() == 7
+
+
+def test_mesmer_sizes_keep_physical_values_at_another_magnification():
+    cell, nuc = mesmer_postprocess_kwargs(min_cell_area=15, cell_expansion=1.0, scale=0.7)
+    assert cell == dict(small_objects_threshold=29, fill_holes_threshold=29, pixel_expansion=1)
+    assert nuc == dict(small_objects_threshold=7, fill_holes_threshold=7)
+    assert mesmer_postprocess_kwargs(min_cell_area=15, scale=1.0)[1] == dict()
+
+
+def test_nuclear_markers_choose_the_nuclear_image():
+    rng = np.random.default_rng(0)
+    labels = pd.Series(["DNA1(Ir191)", "DNA2(Ir193)", "HH3(In113)", "CD3(Er170)"])
+    stack = rng.random((4,) + SHAPE)
+    image = prepare_stack(stack, labels, "nuclear", normalization="percentile", nuclear_markers=["DNA1", "HH3"])
+    assert np.allclose(image, percentile_normalize(stack[[0, 2]]).mean(0))
+    default = prepare_stack(stack, labels, "nuclear", normalization="percentile")
+    assert np.allclose(default, percentile_normalize(stack[[0, 1]]).mean(0))
+    with pytest.raises(ValueError):
+        prepare_stack(stack, labels, "nuclear", nuclear_markers=["H3K27me3"])
+
+
+def scene_with_nucleus_piece(piece_peak: bool):
+    """A nucleus in cell 1 and a small piece of nucleus touching it, in cell 2."""
+    shape = (40, 60)
+    yy, xx = np.indices(shape)
+    cell = np.zeros(shape, int)
+    nuc = np.zeros(shape, int)
+    cell[5:35, 5:30] = 1
+    nuc[disk(shape, (20, 17), 6)] = 1
+    cell[14:27, 30:40] = 2
+    piece = np.zeros(shape, bool)
+    piece[18:22, 23:26] = True
+    piece &= nuc == 0
+    nuc[piece] = 2
+    cell[piece] = 2
+    dna = 100 * np.exp(-((yy - 20) ** 2 + (xx - 17) ** 2) / (2 * 3.5**2))
+    if piece_peak:
+        dna = dna + 80 * np.exp(-((yy - 20) ** 2 + (xx - 25) ** 2) / (2 * 1.0**2))
+    # an unrelated nucleus far away, so that nucleus sizes have a median
+    cell[5:20, 45:58] = 3
+    nuc[disk(shape, (12, 51), 5)] = 3
+    dna = dna + 100 * np.exp(-((yy - 12) ** 2 + (xx - 51) ** 2) / (2 * 3.0**2))
+    return np.stack([cell, nuc], -1), dna
+
+
+def test_nucleus_piece_without_its_own_peak_is_joined():
+    mask, dna = scene_with_nucleus_piece(piece_peak=False)
+    out, _ = qc_cell_and_nuclear_masks(mask, dna, partial_nucleus_area=15)
+    assert out[20, 24, 0] != out[20, 17, 0]  # the DNA dip keeps them apart under rule 1
+    out, table = qc_cell_and_nuclear_masks(
+        mask, dna, partial_nucleus_area=15, join_pieces_without_peak=True
+    )
+    check_pairing(out)
+    assert out[20, 24, 0] == out[20, 17, 0]
+    assert out[20, 35, 0] == out[20, 17, 0]  # the cell of the piece joins too
+    assert table["merged_pieces"].max() == 2
+
+
+def test_nucleus_piece_with_its_own_peak_is_not_joined():
+    mask, dna = scene_with_nucleus_piece(piece_peak=True)
+    out, _ = qc_cell_and_nuclear_masks(
+        mask, dna, partial_nucleus_area=15, join_pieces_without_peak=True
+    )
+    check_pairing(out)
+    assert out[20, 25, 0] != out[20, 17, 0]
+
+
+def test_qc_minimum_cell_area_applies_after_joins():
+    mask, dna = scene_with_nucleus_piece(piece_peak=False)
+    out, _ = qc_cell_and_nuclear_masks(
+        mask, dna, partial_nucleus_area=15, join_pieces_without_peak=True, min_cell_area=200
+    )
+    # the piece and its small cell survive as part of the large cell; the third cell is removed
+    assert out[20, 24, 0] > 0 and out[20, 24, 0] == out[20, 17, 0]
+    assert out[12, 51, 0] == 0

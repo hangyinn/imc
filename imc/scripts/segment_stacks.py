@@ -88,6 +88,10 @@ def main(cli: tp.Sequence[str] = None) -> int:
                 keep_nuclei_whole=args.keep_nuclei_whole,
                 merge_marker=args.merge_marker,
                 max_marker_cell_area=args.max_marker_cell_area,
+                mesmer_mpp=args.mesmer_mpp,
+                qc_min_cell_area=args.qc_min_cell_area,
+                nuclear_markers=[c for c in args.nuclear_markers.split(",") if c] or None,
+                join_pieces_without_peak=args.join_pieces_without_peak,
             )
         except ValueError as e:
             print("Error segmenting stack. Perhaps XY shape is not compatible?")

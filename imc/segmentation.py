@@ -82,6 +82,7 @@ def mesmer_postprocess_kwargs(
     min_cell_area: float = None,
     min_nucleus_area: float = None,
     cell_expansion: float = None,
+    scale: float = 1.0,
 ) -> tp.Tuple[tp.Dict[str, tp.Any], tp.Dict[str, tp.Any]]:
     """
     Mesmer post-processing settings for the whole-cell and nuclear compartments.
@@ -90,6 +91,11 @@ def mesmer_postprocess_kwargs(
     and fills holes, smaller than a number of pixels counted at that scale. Sizes are
     given here in square micrometres and converted to that scale. ``None`` or 0 keeps
     Mesmer's default of 15 pixels (about 4 um2).
+
+    ``scale`` is the pixel size given to Mesmer divided by the true pixel size (see
+    ``mesmer_mpp`` in ``segment_roi``). When it differs from 1, Mesmer works at a
+    different magnification, and all sizes, including Mesmer's default of 15 pixels,
+    are converted so that they keep the same physical value.
 
     Parameters
     ----------
@@ -109,17 +115,25 @@ def mesmer_postprocess_kwargs(
     Settings for ``postprocess_kwargs_whole_cell`` and ``postprocess_kwargs_nuclear``.
     """
 
+    rescale = scale is not None and not np.isclose(scale, 1.0)
+
     def size_kwargs(area: tp.Optional[float]) -> tp.Dict[str, tp.Any]:
         if not area:
-            return dict()
-        n = max(1, int(round(area / MESMER_MPP**2)))
+            if not rescale:
+                return dict()
+            n = 15  # Mesmer's default, in pixels at its working scale
+        else:
+            n = max(1, int(round(area / MESMER_MPP**2)))
+        if rescale:
+            n = max(1, int(round(n * scale**2)))
         return dict(small_objects_threshold=n, fill_holes_threshold=n)
 
     cell = size_kwargs(min_cell_area)
     if whole_cell_threshold is not None:
         cell["interior_threshold"] = whole_cell_threshold
     if cell_expansion:
-        cell["pixel_expansion"] = max(1, int(round(cell_expansion / MESMER_MPP)))
+        e = max(1, int(round(cell_expansion / MESMER_MPP)))
+        cell["pixel_expansion"] = max(1, int(round(e * scale))) if rescale else e
     return cell, size_kwargs(min_nucleus_area)
 
 
@@ -131,6 +145,7 @@ def prepare_stack(
     membrane_channels: tp.Sequence[str] = None,
     normalization: str = "equalize",
     membrane_mode: str = "mean",
+    nuclear_markers: tp.Sequence[str] = None,
 ) -> Array:
     """
     Make the nuclear and/or membrane image used as segmentation input.
@@ -156,6 +171,10 @@ def prepare_stack(
         How the normalized membrane channels are combined: ``mean``, or ``max`` (the
         brightest marker in each pixel, so that a cell expressing only one of the
         markers is outlined as clearly as one expressing several).
+    nuclear_markers: list[str]
+        Markers averaged into the nuclear image, matched like ``membrane_channels``,
+        e.g. ['DNA1', 'DNA2', 'HH3'] to add histone H3 to the two DNA channels. By
+        default the DNA (iridium) channels.
     """
     assert compartment in ["nuclear", "cytoplasm", "both"]
     assert normalization in ["equalize", "percentile"]
@@ -169,7 +188,14 @@ def prepare_stack(
 
     # Get nuclear channels
     nuclear_chs = nuclear_channels(channel_labels)
-    nucl = norm(stack[nuclear_chs]).mean(0)
+    if nuclear_markers:
+        names = marker_names(channel_labels)
+        missing = [m for m in nuclear_markers if m not in names.values]
+        if missing:
+            raise ValueError(f"Nuclear markers not found in stack: {missing}")
+        nucl = norm(stack[names.isin(list(nuclear_markers)).values]).mean(0)
+    else:
+        nucl = norm(stack[nuclear_chs]).mean(0)
     if compartment == "nuclear":
         return nucl
 
@@ -1649,6 +1675,20 @@ def dna_image(roi: _roi.ROI) -> Array:
     return np.asarray(stack[nuclear_channels(labels)], dtype=float).mean(0)
 
 
+def nuclear_marker_image(roi: _roi.ROI, markers: tp.Sequence[str]) -> Array:
+    """Mean of several markers of an ROI, each divided by its 99.8th percentile (no clipping)."""
+    stack, labels = roi.stack, roi.channel_labels
+    if roi.channel_exclude is not None:
+        keep = ~np.asarray(roi.channel_exclude, dtype=bool)
+        stack, labels = stack[keep], labels[keep]
+    names = marker_names(labels)
+    missing = [m for m in markers if m not in names.values]
+    if missing:
+        raise ValueError(f"Markers not found in stack: {missing}")
+    chs = np.asarray(stack[names.isin(list(markers)).values], dtype=float)
+    return np.mean([c / max(np.percentile(c, 99.8), 1e-9) for c in chs], 0)
+
+
 def marker_image(roi: _roi.ROI, marker: str) -> Array:
     """Signal of one marker of an ROI, e.g. 'CD68', without normalization."""
     stack, labels = roi.stack, roi.channel_labels
@@ -1672,6 +1712,86 @@ def marker_signal_image(roi: _roi.ROI) -> Array:
     return np.asarray(stack[sel], dtype=float).sum(0)
 
 
+def nuclear_peaks(
+    image: Array,
+    nuclei: Array,
+    sigma: float = 2.2,
+    background_sigma: float = 15.0,
+    min_distance: int = 4,
+) -> Array:
+    """
+    Centres of nucleus-sized blobs in a nuclear (DNA) image.
+
+    The image is divided by its local background (Gaussian of ``background_sigma``
+    pixels) and filtered with a Laplacian of Gaussian of ``sigma`` pixels; local maxima
+    at least ``min_distance`` pixels apart are kept if their response is at least the
+    10th percentile of the response at the centres of ``nuclei`` and the smoothed image
+    there is at least 0.2 times its median inside ``nuclei``.
+
+    Returns an array of shape (N, 2) with the row and column of each peak.
+    """
+    from skimage.feature import peak_local_max
+
+    img = np.asarray(image, dtype=float)
+    inside = nuclei > 0
+    if not inside.any():
+        return np.zeros((0, 2), dtype=int)
+    eps = 0.02 * max(float(np.median(img[inside])), 1e-12)
+    response = -ndi.gaussian_laplace(img / (ndi.gaussian_filter(img, background_sigma) + eps), sigma)
+    ids = np.unique(nuclei[inside])
+    centres = np.asarray(ndi.center_of_mass(np.ones_like(nuclei), nuclei, ids))
+    cy = np.clip(np.round(centres[:, 0]).astype(int), 0, img.shape[0] - 1)
+    cx = np.clip(np.round(centres[:, 1]).astype(int), 0, img.shape[1] - 1)
+    threshold = float(np.percentile(response[cy, cx], 10))
+    smooth = ndi.gaussian_filter(img, 1.0)
+    floor = 0.2 * float(np.median(smooth[inside]))
+    peaks = peak_local_max(
+        response, min_distance=min_distance, threshold_abs=threshold, exclude_border=False
+    )
+    return peaks[smooth[peaks[:, 0], peaks[:, 1]] >= floor]
+
+
+def _join_pieces_without_peak(
+    nuc: Array, peaks: Array, max_piece_area: float, max_union_area: float = 2.5
+) -> tp.Tuple[Array, int]:
+    """
+    Join each nucleus piece smaller than ``max_piece_area`` pixels that holds none of
+    ``peaks`` to the nucleus it touches over the longest border, unless the joined
+    nucleus would exceed ``max_union_area`` times the median nucleus. Smallest pieces
+    are joined first.
+
+    Returns the new label of each label and the number of joins.
+    """
+    n = int(nuc.max()) + 1
+    area = np.bincount(nuc.ravel(), minlength=n)
+    has_peak = np.zeros(n, dtype=bool)
+    if len(peaks):
+        has_peak[nuc[peaks[:, 0], peaks[:, 1]]] = True
+    pieces = np.flatnonzero((area > 0) & (area < max_piece_area) & ~has_peak)
+    pieces = pieces[pieces > 0]
+    if len(pieces) == 0:
+        return np.arange(n), 0
+    a = np.concatenate([nuc[:, :-1].ravel(), nuc[:-1, :].ravel()])
+    b = np.concatenate([nuc[:, 1:].ravel(), nuc[1:, :].ravel()])
+    touch = (a != b) & (a > 0) & (b > 0)
+    lo, hi = np.minimum(a[touch], b[touch]), np.maximum(a[touch], b[touch])
+    keys, contact = np.unique(lo.astype(np.int64) * n + hi, return_counts=True)
+    pa, pb = keys // n, keys % n
+    pairs = pd.DataFrame(
+        {"piece": np.r_[pa, pb], "other": np.r_[pb, pa], "contact": np.r_[contact, contact]}
+    )
+    pairs = pairs[pairs["piece"].isin(pieces)]
+    best = pairs.sort_values("contact", ascending=False).drop_duplicates("piece")
+    best = best.assign(area=area[best["piece"].values]).sort_values("area")
+    median_area = np.median(area[1:][area[1:] > 0])
+    return _union_pairs(
+        zip(best["piece"].values, best["other"].values),
+        n,
+        area=area,
+        max_area=max_union_area * median_area,
+    )
+
+
 def qc_cell_and_nuclear_masks(
     mask: Array,
     nuclear_image: Array,
@@ -1690,6 +1810,8 @@ def qc_cell_and_nuclear_masks(
     marker_quantile: float = 0.95,
     marker_border_ratio: float = 0.9,
     max_marker_cell_area: float = np.inf,
+    join_pieces_without_peak: bool = False,
+    peak_image: Array = None,
 ) -> tp.Tuple[Array, pd.DataFrame]:
     """
     Quality control of paired cell and nuclear masks, as returned by
@@ -1705,6 +1827,13 @@ def qc_cell_and_nuclear_masks(
            ``max_merge_passes`` times, so that a nucleus cut into three or more pieces
            is rejoined. ``max_union_area=1.5`` and ``max_merge_passes=1`` give the
            behaviour of earlier versions.
+        1b. If ``join_pieces_without_peak``, a nucleus piece smaller than
+           ``partial_nucleus_area`` pixels without its own peak in ``peak_image`` (see
+           ``nuclear_peaks``; by default ``nuclear_image``) is joined, with its cell, to
+           the nucleus it touches over the longest border, whatever the signal on the
+           border, unless the joined nucleus would exceed ``max_union_area`` times the
+           median nucleus. A separate nucleus has its own DNA maximum; the DNA dip test
+           of rule 1 still applies to pieces that have one.
         2. If ``merge_marker_image`` is given (e.g. CD68), neighbouring cells that lie
            in one continuous area of its signal are merged, for example a macrophage
            cut into several cells (see ``_merge_cells_in_marker``; both cells above the
@@ -1763,6 +1892,20 @@ def qc_cell_and_nuclear_masks(
         cell = target[cell]
         nuc = target[nuc]
 
+    # 1b. Nucleus pieces without their own DNA peak
+    n_pieces = 0
+    if join_pieces_without_peak and nuc.max() > 0 and partial_nucleus_area:
+        image = nuclear_image if peak_image is None else peak_image
+        peaks = nuclear_peaks(image, nuc)
+        joined, n_pieces = _join_pieces_without_peak(
+            nuc, peaks, partial_nucleus_area, max_union_area=max_union_area
+        )
+        full = np.arange(max(int(target.max()), int(cell.max())) + 1)
+        full[: len(joined)] = joined
+        target = full[target]
+        cell = full[cell]
+        nuc = full[nuc]
+
     # 2. One cell cut into several within continuous marker signal
     n_marker = 0
     if merge_marker_image is not None and cell.max() > 0:
@@ -1819,7 +1962,8 @@ def qc_cell_and_nuclear_masks(
     )
     if verbose:
         print(
-            f"Cell QC: {n_merged} joins of split nuclei, {n_marker} joins of cells within "
+            f"Cell QC: {n_merged} joins of split nuclei, {n_pieces} joins of nucleus pieces "
+            f"without their own DNA peak, {n_marker} joins of cells within "
             f"continuous marker signal; {int(small.sum())} cells "
             f"under {min_cell_area:g} px and {n_empty} empty cells without nucleus removed; "
             f"{int((~table['has_nucleus']).sum())} cells without nucleus, "
@@ -1857,6 +2001,10 @@ def segment_roi(
     keep_nuclei_whole: bool = True,
     merge_marker: str = None,
     max_marker_cell_area: float = 300.0,
+    mesmer_mpp: float = None,
+    qc_min_cell_area: float = None,
+    nuclear_markers: tp.Sequence[str] = None,
+    join_pieces_without_peak: bool = False,
 ) -> tp.Dict[str, tp.Any]:
     """
     Segment the area of an ROI.
@@ -1939,6 +2087,25 @@ def segment_roi(
         step (one macrophage cut into several cells). Off by default.
     max_marker_cell_area: float
         Largest cell (um2) made by joining cells with ``merge_marker``.
+    mesmer_mpp: float
+        Pixel size given to Mesmer instead of ``image_mpp``, which sets the magnification
+        at which Mesmer works (Mesmer enlarges the image by ``mesmer_mpp / 0.5``). For
+        example 0.7 for IMC images at 1 um/px enlarges them 1.4 times instead of 2.
+        Mesmer's size settings are converted to keep their physical values, and all
+        other steps use ``image_mpp``. By default ``image_mpp``.
+    qc_min_cell_area: float
+        Smallest cell kept by the QC step (um2), applied after nuclei split into pieces
+        are rejoined. By default ``min_cell_area``, which also sets the smallest object
+        Mesmer draws.
+    nuclear_markers: list[str]
+        Markers averaged into Mesmer's nuclear image when segmenting from the stack,
+        e.g. ['DNA1', 'DNA2', 'HH3'] (see ``prepare_stack``). The rules that keep nuclei
+        whole then read the same markers, each divided by its 99.8th percentile. By
+        default the DNA channels.
+    join_pieces_without_peak: bool
+        Whether the QC step joins nucleus pieces smaller than ``partial_nucleus_area``
+        that have no DNA peak of their own to the nucleus they touch (rule 1b of
+        ``qc_cell_and_nuclear_masks``).
 
     Returns
     -------
@@ -1947,8 +2114,13 @@ def segment_roi(
     """
     assert postprocessing_mode in ["align", "legacy"]
     assert membrane_source in ["ilastik", "markers"]
+    model_mpp = mesmer_mpp if mesmer_mpp else image_mpp
     kw_cell, kw_nuc = mesmer_postprocess_kwargs(
-        whole_cell_threshold, min_cell_area, min_nucleus_area, cell_expansion
+        whole_cell_threshold,
+        min_cell_area,
+        min_nucleus_area,
+        cell_expansion,
+        scale=model_mpp / image_mpp,
     )
     maps = None
     if from_probabilities:
@@ -1978,7 +2150,7 @@ def segment_roi(
         mask = deepcell_segment_probabilities(
             np.moveaxis(image, 0, -1),
             compartment,
-            image_mpp=image_mpp,
+            image_mpp=model_mpp,
             postprocess_kwargs_whole_cell=kw_cell,
             postprocess_kwargs_nuclear=kw_nuc,
             return_maps=save_maps and compartment == "both",
@@ -1997,6 +2169,7 @@ def segment_roi(
             membrane_channels=membrane_channels,
             normalization="percentile" if model == "deepcell" else "equalize",
             membrane_mode=membrane_mode,
+            nuclear_markers=nuclear_markers,
         )
         if model == "stardist":
             assert compartment == "nuclear"
@@ -2006,7 +2179,7 @@ def segment_roi(
             mask = deepcell_segment(
                 to_deepcell_input(image),
                 compartment=compartment,
-                image_mpp=image_mpp,
+                image_mpp=model_mpp,
                 postprocess_kwargs_whole_cell=kw_cell,
                 postprocess_kwargs_nuclear=kw_nuc,
                 return_maps=save_maps and compartment == "both",
@@ -2038,7 +2211,10 @@ def segment_roi(
                     roi.channel_exclude,
                     normalization="percentile",
                 )
-            raw_dna = dna_image(roi)
+            if nuclear_markers:
+                raw_dna = nuclear_marker_image(roi, nuclear_markers)
+            else:
+                raw_dna = dna_image(roi)
             if raw_dna.shape != mask.shape[:2]:
                 raw_dna = resize(raw_dna, mask.shape[:2])
             mask = align_cell_and_nuclear_masks(
@@ -2054,7 +2230,10 @@ def segment_roi(
                 mask, cell_qc = qc_cell_and_nuclear_masks(
                     mask,
                     raw_dna,
-                    min_cell_area=(min_cell_area or 0) / px,
+                    min_cell_area=(
+                        (min_cell_area if qc_min_cell_area is None else qc_min_cell_area) or 0
+                    )
+                    / px,
                     partial_nucleus_area=(partial_nucleus_area or 0) / px,
                     signal_image=marker_signal_image(roi),
                     verbose=verbose,
@@ -2064,6 +2243,7 @@ def segment_roi(
                         marker_image(roi, merge_marker) if merge_marker else None
                     ),
                     max_marker_cell_area=(max_marker_cell_area or np.inf) / px,
+                    join_pieces_without_peak=join_pieces_without_peak,
                 )
                 cell_qc.insert(2, "area_um2", cell_qc["area"] * px)
                 cell_qc.insert(4, "nucleus_area_um2", cell_qc["nucleus_area"] * px)

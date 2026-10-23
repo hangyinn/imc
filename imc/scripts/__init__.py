@@ -805,6 +805,48 @@ cli_config = {
                 },
             },
             {
+                "args": ["--mesmer-mpp"],
+                "kwargs": {
+                    "dest": "mesmer_mpp",
+                    "type": float,
+                    "default": None,
+                    "help": "Pixel size (um) given to DeepCell instead of '--image-mpp', which "
+                    "sets the magnification DeepCell works at (it enlarges the image by this "
+                    "value / 0.5), e.g. 0.7 for 1 um/px IMC images. Size settings keep their "
+                    "physical values. Default is '--image-mpp'.",
+                },
+            },
+            {
+                "args": ["--qc-min-cell-area"],
+                "kwargs": {
+                    "dest": "qc_min_cell_area",
+                    "type": float,
+                    "default": None,
+                    "help": "Smallest cell (um2) kept by the QC step, applied after nuclei "
+                    "split into pieces are rejoined. Default is '--min-cell-area'.",
+                },
+            },
+            {
+                "args": ["--nuclear-markers"],
+                "kwargs": {
+                    "dest": "nuclear_markers",
+                    "default": "",
+                    "help": "Comma-delimited list of markers averaged into the nuclear image "
+                    "when segmenting from the stack, e.g. 'DNA1,DNA2,HH3'. "
+                    "Default is the DNA channels.",
+                },
+            },
+            {
+                "args": ["--join-pieces-without-peak"],
+                "kwargs": {
+                    "dest": "join_pieces_without_peak",
+                    "action": "store_true",
+                    "help": "Whether the QC step joins nucleus pieces smaller than "
+                    "'--partial-nucleus-area' that have no DNA peak of their own to the "
+                    "nucleus they touch, without the DNA dip test.",
+                },
+            },
+            {
                 "args": ["--verbose"],
                 "kwargs": {
                     "dest": "quiet",
